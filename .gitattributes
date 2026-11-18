@@ -1,0 +1,8 @@
+# Keep upstream package and model sources out of this project's language stats.
+thirdparty/** linguist-vendored
+
+# Generated media and binary models do not have useful line-based diffs.
+*.hdr binary
+*.glb binary
+*.stl binary
+*.mp4 binary
