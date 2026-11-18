@@ -1,0 +1,7 @@
+# Runtime products; the source dataset is mounted read-only at run time.
+/outputs/
+__pycache__/
+*.py[cod]
+*.log
+MUJOCO_LOG.TXT
+.DS_Store
