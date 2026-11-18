@@ -21,6 +21,7 @@ Object choice and placement are repeatable with a seed. The RealSense image is 6
 ## Layout
 
 - `examples/ur5e_eye_in_hand/` — scene builder, interactive viewer, RGB-D capture, and optional ZMQ subscriber.
+- `examples/open_vocab_pipeline/` — YOLO-World detection and SAM2 Tiny segmentation of wrist RGB frames.
 - `examples/maniskill3/` — a separate ManiSkill PickCube experiment.
 - `thirdparty/mujoco_menagerie/` — only the UR5e, 2F-85, and D435i model assets used here.
 - `thirdparty/maniskill3/` — ManiSkill 3.0.1 package source and bundled assets.
@@ -60,6 +61,20 @@ docker exec vla_scenegraph_env /root/miniconda3/bin/python \
 ```
 
 Generated frames and converted object meshes go under `outputs/`; this directory is disposable and can be regenerated from the read-only dataset. See [the example guide](examples/ur5e_eye_in_hand/README.md) for gripper controls, camera close-ups, and ZMQ streaming.
+
+## Detect and segment objects in wrist frames
+
+After capturing a frame, install the perception dependencies and run YOLO-World with text prompts followed by SAM2 Tiny box-prompted segmentation:
+
+```bash
+docker exec vla_scenegraph_env /root/miniconda3/bin/pip install \
+  -r /workspace/examples/open_vocab_pipeline/requirements.txt
+docker exec -it vla_scenegraph_env /root/miniconda3/bin/python \
+  /workspace/examples/open_vocab_pipeline/run.py \
+  --prompts "red cube, green bell pepper, toy car" --confidence 0.005
+```
+
+See [the open-vocabulary example guide](examples/open_vocab_pipeline/README.md) for saved-frame, directory, and live ZMQ modes, plus the mask and JSON outputs.
 
 ## Run the ManiSkill example
 

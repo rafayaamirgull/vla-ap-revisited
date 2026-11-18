@@ -1,0 +1,5 @@
+ultralytics==8.4.31
+git+https://github.com/ultralytics/CLIP.git@7ffa84b3bfa40c42ecc1c77147a855e69cb2dd40
+torch==2.9.1
+torchvision==0.24.1
+pyzmq>=26,<28
