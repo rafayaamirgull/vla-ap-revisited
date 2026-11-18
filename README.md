@@ -2,21 +2,21 @@
 
 This project runs a UR5e with a Robotiq 2F-85 gripper and a side-mounted RealSense D435i in MuJoCo. The camera looks along the gripper approach axis. A red cube and two or three HomebrewedDB objects appear on the table with their original colors.
 
-## Simulation previews
+## Preview
 
-Each scene randomly selects and places HomebrewedDB objects. These two reproducible examples each contain three dataset objects plus the red cube:
+<p align="center">
+  <img src="docs/images/tabletop_seed_7.png" width="760" alt="UR5e, gripper, and RealSense above a tabletop with a cube and three HomebrewedDB objects">
+</p>
+<p align="center"><sub>Tabletop scene · seed 7 · three randomly selected objects plus the cube</sub></p>
 
-| Seed 7 | Seed 42 |
-|:--:|:--:|
-| ![UR5e tabletop scene with green figure and two other objects](docs/images/tabletop_seed_7.png) | ![UR5e tabletop scene with cup and toy vehicles](docs/images/tabletop_seed_42.png) |
+<p align="center">
+  <a href="docs/images/tabletop_seed_42.png"><img src="docs/images/tabletop_seed_42.png" width="250" alt="Alternate tabletop scene with a cup and two toy vehicles"></a>
+  <a href="docs/images/eye_in_hand_rgb.png"><img src="docs/images/eye_in_hand_rgb.png" width="250" alt="RGB view from the wrist-mounted RealSense D435i"></a>
+  <a href="docs/images/ur5e_camera_mount.png"><img src="docs/images/ur5e_camera_mount.png" width="250" alt="Close-up of the RealSense camera mount beside the gripper"></a>
+</p>
+<p align="center"><sub>Alternate scene (seed 42) · RealSense RGB view (seed 7) · camera mount</sub></p>
 
-The 640×480 RGB image below is captured from the side-mounted RealSense D435i in the seed 7 scene. The capture script also writes metric depth for every pixel.
-
-![RealSense D435i eye-in-hand RGB view of the seed 7 tabletop scene](docs/images/eye_in_hand_rgb.png)
-
-The camera is fixed to the end effector beside the gripper:
-
-![Close-up of the UR5e gripper and RealSense camera mount](docs/images/ur5e_camera_mount.png)
+Object choice and placement are repeatable with a seed. The RealSense image is 640×480; the capture script also saves metric depth for every pixel.
 
 ## Layout
 
