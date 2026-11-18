@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -160,12 +161,21 @@ def prepare_object(root: Path, object_id: int, cache_dir: Path) -> PreparedObjec
     info_path = cache_dir / f"{stem}.json"
     source_stat = source.stat()
     if obj_path.is_file() and png_path.is_file() and info_path.is_file():
-        cached = json.loads(info_path.read_text(encoding="utf-8"))
-        if (cached.get("version") == CACHE_VERSION and
-                cached.get("source_size") == source_stat.st_size and
-                cached.get("source_mtime_ns") == source_stat.st_mtime_ns):
-            return PreparedObject(object_id, obj_path, png_path,
-                                  tuple(cached["size_m"]), cached["face_count"])
+        try:
+            cached = json.loads(info_path.read_text(encoding="utf-8"))
+            size_m = cached["size_m"]
+            face_count = cached["face_count"]
+            if (cached.get("version") == CACHE_VERSION and
+                    cached.get("source_size") == source_stat.st_size and
+                    cached.get("source_mtime_ns") == source_stat.st_mtime_ns and
+                    isinstance(size_m, list) and len(size_m) == 3 and
+                    all(type(size) in (int, float) and math.isfinite(size) and size > 0
+                        for size in size_m) and
+                    type(face_count) is int and face_count > 0):
+                return PreparedObject(object_id, obj_path, png_path,
+                                      tuple(size_m), face_count)
+        except (OSError, UnicodeError, ValueError, KeyError, TypeError, AttributeError):
+            pass
 
     print(f"Converting {source.name} with its original vertex colors...", flush=True)
     xyz_mm, normals, rgb, faces = _read_ply(source)
@@ -192,5 +202,14 @@ def prepare_object(root: Path, object_id: int, cache_dir: Path) -> PreparedObjec
         "size_m": size_m,
         "face_count": len(faces),
     }
-    info_path.write_text(json.dumps(cache_data, indent=2) + "\n", encoding="utf-8")
+    info_tmp = None
+    try:
+        with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=cache_dir,
+                                         prefix=f"{stem}.json.tmp.", delete=False) as handle:
+            info_tmp = Path(handle.name)
+            handle.write(json.dumps(cache_data, indent=2) + "\n")
+        info_tmp.replace(info_path)
+    finally:
+        if info_tmp is not None:
+            info_tmp.unlink(missing_ok=True)
     return PreparedObject(object_id, obj_path, png_path, size_m, len(faces))

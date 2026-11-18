@@ -333,6 +333,7 @@ def main() -> None:
                         mujoco.mj_step(model, data)
                 if publisher is not None:
                     time.sleep(max(0.0, wall_start + frame / args.fps - time.monotonic()))
+                mujoco.mj_forward(model, data)
                 rgb, depth = capture(renderer, data)
                 meta = camera_metadata(model, data, frame, scene)
                 stem = f"frame_{frame:04d}"
