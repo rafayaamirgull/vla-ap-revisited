@@ -11,8 +11,9 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-from geometry import (backproject_mask, dense_component_pixels, infer_relations,
-                      largest_metric_cluster, transform_points, world_from_optical)
+from geometry import (backproject_mask, contact_patch, dense_component_pixels,
+                      infer_relations, largest_metric_cluster, observed_aabb,
+                      transform_points, world_from_optical)
 from run import clip_crop, load_aligned_inputs, make_graph, sha256
 
 
@@ -94,6 +95,23 @@ class GeometryTests(unittest.TestCase):
         self.assertTrue(any(e["relation"] == "inside" and e["source"] == "object_03"
                             and e["target"] == "object_02" for e in edges))
 
+    def test_sparse_visible_contact_patch_recovers_table_support(self):
+        table = node("table", [-1, -1, -0.1], [1, 1, 0])
+        low = np.array([[x, y, 0.028] for x in np.linspace(0, 0.04, 5)
+                        for y in np.linspace(0, 0.04, 5)])
+        high = np.array([[x, y, 0.1] for x in np.linspace(0, 0.04, 45)
+                         for y in np.linspace(0, 0.04, 45)])
+        cloud = np.vstack((low, high))
+        subject = node("object_00", [0, 0, 0.05], [0.04, 0.04, 0.1])
+        subject["world_aabb_m"] = observed_aabb(cloud)
+        subject["table_contact"] = contact_patch(cloud, 0, 0.03, 0.008, 0.025)
+        self.assertGreater(subject["world_aabb_m"]["min"][2], 0.025)
+        self.assertEqual(subject["table_contact"]["largest_connected_patch_points"], 25)
+        edges = infer_relations([subject], table)
+        self.assertEqual([(edge["relation"], edge["target"]) for edge in edges],
+                         [("on", "table")])
+        self.assertEqual(edges[0]["evidence"]["method"], "connected_visible_contact_patch")
+
     def test_replaced_rgb_is_rejected(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -168,7 +186,9 @@ class GeometryTests(unittest.TestCase):
             report_path.write_text(json.dumps(report))
             args = Namespace(min_depth=0.1, max_depth=2.0, max_pixels=10,
                              min_points=8, voxel_size=0.008, cluster_radius=0.04,
-                             support_tolerance=0.025, neighbor_distance=0.12,
+                             support_tolerance=0.025, contact_band=0.03,
+                             min_contact_points=20, neighbor_distance=0.08,
+                             clip_margin=0.04, allow_border_masks=False,
                              interiors=None, output_dir=root / "graph")
             graph, clouds = make_graph(report_path, FakeEncoder(), args)
             self.assertEqual(len(graph["nodes"]), 2)

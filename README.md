@@ -36,7 +36,7 @@ The Docker image has separate Python environments: `/root/miniconda3/bin/python`
 Start from this directory. The HomebrewedDB mount is read-only:
 
 ```bash
-HB_ROOT='/media/rafay/Windows-SSD/other/data/open_source/HB_HomebrewedDB_TUM'
+HB_ROOT='/media/rafay/Windows-SSD1/other/data/open_source/HB_HomebrewedDB_TUM'
 XAUTH_FILE="${XAUTHORITY:-$HOME/.Xauthority}"
 docker run -it --rm --name vla_scenegraph_env --gpus all --ipc=host --network=host \
   -e DISPLAY="$DISPLAY" -e XAUTHORITY=/tmp/.Xauthority \
@@ -46,7 +46,7 @@ docker run -it --rm --name vla_scenegraph_env --gpus all --ipc=host --network=ho
   -w /workspace -d vla_scenegraph_env:v01
 ```
 
-The Xauthority mount lets the container authenticate to the host X server for MuJoCo rendering. Make sure `HB_ROOT` points to the mounted dataset; an empty directory produces the cube-only scene.
+The Xauthority mount lets the container authenticate to the host X server for MuJoCo rendering. Drive mount names can change; update `HB_ROOT` and verify that `hb_models/models/models_info.json` exists beneath it. An empty directory produces the cube-only scene.
 
 With the container running, open the scene or the live camera view:
 

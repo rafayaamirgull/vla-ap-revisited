@@ -60,9 +60,68 @@ def check_capture_fingerprints(metadata: dict | None, rgb: np.ndarray,
         raise ValueError("Camera metadata depth fingerprint does not match the frame")
 
 
+def filter_candidates(candidates: list[dict], depth: np.ndarray | None,
+                      max_detections: int, min_depth: float, max_depth: float,
+                      min_valid_fraction: float, min_valid_pixels: int,
+                      max_mask_fraction: float, min_component_fraction: float,
+                      duplicate_iou: float, allow_border_masks: bool
+                      ) -> tuple[list[dict], list[dict]]:
+    """Keep distinct, depth-supported masks in descending detector-score order."""
+    accepted, rejected = [], []
+    for candidate in sorted(candidates, key=lambda item: item["confidence"], reverse=True):
+        mask = candidate["mask"]
+        area = int(np.count_nonzero(mask))
+        candidate["mask_area_px"] = area
+        candidate["mask_area_fraction"] = area / mask.size
+        candidate["touches_image_border"] = bool(mask[0].any() or mask[-1].any() or
+                                                  mask[:, 0].any() or mask[:, -1].any())
+        components, _, stats, _ = cv2.connectedComponentsWithStats(mask.astype(np.uint8), 8)
+        largest_component = int(np.max(stats[1:, cv2.CC_STAT_AREA])) if components > 1 else 0
+        candidate["largest_component_fraction"] = largest_component / area if area else 0.0
+        reason = None
+        if area == 0:
+            reason = "empty_mask"
+        elif candidate["mask_area_fraction"] > max_mask_fraction:
+            reason = "mask_covers_too_much_of_frame"
+        elif candidate["largest_component_fraction"] < min_component_fraction:
+            reason = "fragmented_mask"
+        elif candidate["touches_image_border"] and not allow_border_masks:
+            reason = "truncated_at_image_border"
+        if depth is not None:
+            valid = mask & np.isfinite(depth) & (depth >= min_depth) & (depth <= max_depth)
+            candidate["valid_depth_pixels"] = int(np.count_nonzero(valid))
+            candidate["valid_depth_fraction"] = candidate["valid_depth_pixels"] / area if area else 0.0
+            if reason is None and (candidate["valid_depth_pixels"] < min_valid_pixels or
+                                   candidate["valid_depth_fraction"] < min_valid_fraction):
+                reason = "insufficient_valid_depth"
+        if reason is None:
+            for prior in accepted:
+                prior_mask = prior["mask"]
+                intersection = int(np.count_nonzero(mask & prior_mask))
+                union = area + prior["mask_area_px"] - intersection
+                if union and intersection / union >= duplicate_iou:
+                    reason = "duplicate_mask"
+                    candidate["duplicate_of"] = prior["mask_index"]
+                    break
+        if reason is None and len(accepted) >= max_detections:
+            reason = "max_detections_after_filtering"
+        if reason is None:
+            candidate["mask_index"] = len(accepted)
+            accepted.append(candidate)
+        else:
+            rejection = {key: value for key, value in candidate.items() if key != "mask"}
+            rejection["reason"] = reason
+            rejected.append(rejection)
+    return accepted, rejected
+
+
 class OpenVocabPipeline:
     def __init__(self, prompts: list[str], detector_weight: Path, segmenter_weight: Path,
-                 device: str, confidence: float, max_detections: int) -> None:
+                 device: str, confidence: float, max_detections: int,
+                 min_depth: float, max_depth: float, min_valid_fraction: float,
+                 min_valid_pixels: int, max_mask_fraction: float,
+                 min_component_fraction: float, duplicate_iou: float,
+                 allow_border_masks: bool) -> None:
         try:
             import torch
             from ultralytics import SAM, YOLOWorld
@@ -72,6 +131,14 @@ class OpenVocabPipeline:
         self.device = ("0" if torch.cuda.is_available() else "cpu") if device == "auto" else device
         self.confidence = confidence
         self.max_detections = max_detections
+        self.min_depth = min_depth
+        self.max_depth = max_depth
+        self.min_valid_fraction = min_valid_fraction
+        self.min_valid_pixels = min_valid_pixels
+        self.max_mask_fraction = max_mask_fraction
+        self.min_component_fraction = min_component_fraction
+        self.duplicate_iou = duplicate_iou
+        self.allow_border_masks = allow_border_masks
         self.detector_weight = detector_weight
         self.segmenter_weight = segmenter_weight
         print(f"Loading YOLO-World and SAM2 Tiny on {self.device}...", flush=True)
@@ -79,16 +146,18 @@ class OpenVocabPipeline:
         self.detector.set_classes(prompts)
         self.segmenter = SAM(str(segmenter_weight))
 
-    def infer(self, bgr: np.ndarray) -> tuple[list[dict], float, float]:
+    def infer(self, bgr: np.ndarray, depth: np.ndarray | None
+              ) -> tuple[list[dict], list[dict], float, float]:
         started = time.perf_counter()
         result = self.detector.predict(
-            source=bgr, imgsz=640, conf=self.confidence, max_det=self.max_detections,
+            source=bgr, imgsz=640, conf=self.confidence,
+            max_det=self.max_detections * 3,
             device=self.device, verbose=False,
         )[0]
         detect_ms = (time.perf_counter() - started) * 1000
         boxes = result.boxes
         if boxes is None or len(boxes) == 0:
-            return [], detect_ms, 0.0
+            return [], [], detect_ms, 0.0
 
         xyxy = boxes.xyxy.cpu().numpy()
         scores = boxes.conf.cpu().numpy()
@@ -117,12 +186,17 @@ class OpenVocabPipeline:
                 "confidence": float(score),
                 "box_xyxy": [float(value) for value in box],
                 "mask": mask.astype(bool),
-                "mask_index": index,
+                "candidate_index": index,
             })
-        return detections, detect_ms, segment_ms
+        accepted, rejected = filter_candidates(
+            detections, depth, self.max_detections, self.min_depth, self.max_depth,
+            self.min_valid_fraction, self.min_valid_pixels, self.max_mask_fraction,
+            self.min_component_fraction, self.duplicate_iou, self.allow_border_masks)
+        return accepted, rejected, detect_ms, segment_ms
 
 
-def save_frame(bgr: np.ndarray, detections: list[dict], source: str, stem: str,
+def save_frame(bgr: np.ndarray, detections: list[dict], rejected: list[dict],
+               source: str, stem: str,
                camera_metadata: dict | None, pipeline: OpenVocabPipeline,
                detect_ms: float, segment_ms: float, output_dir: Path,
                rgb_path: Path, depth_path: Path | None, depth: np.ndarray | None) -> None:
@@ -142,7 +216,7 @@ def save_frame(bgr: np.ndarray, detections: list[dict], source: str, stem: str,
         overlay[mask] = (0.55 * overlay[mask] + 0.45 * np.asarray(color)).astype(np.uint8)
         x1, y1, x2, y2 = (round(value) for value in detection["box_xyxy"])
         cv2.rectangle(overlay, (x1, y1), (x2, y2), color, 2)
-        caption = f"{detection['label']} {detection['confidence']:.2f}"
+        caption = f"{detection['label']} {detection['confidence']:.5f}"
         (text_width, text_height), _ = cv2.getTextSize(caption, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
         text_x = min(max(x1, 0), max(0, bgr.shape[1] - text_width - 4))
         text_y = max(text_height + 4, y1 - 7)
@@ -171,12 +245,21 @@ def save_frame(bgr: np.ndarray, detections: list[dict], source: str, stem: str,
                    "segmenter": str(pipeline.segmenter_weight)},
         "timing_ms": {"detector": round(detect_ms, 1), "segmenter": round(segment_ms, 1)},
         "camera_metadata": camera_metadata,
+        "post_filter": {"candidate_pool_limit": pipeline.max_detections * 3,
+                        "min_depth_m": pipeline.min_depth, "max_depth_m": pipeline.max_depth,
+                        "min_valid_depth_fraction": pipeline.min_valid_fraction,
+                        "min_valid_depth_pixels": pipeline.min_valid_pixels,
+                        "max_mask_fraction": pipeline.max_mask_fraction,
+                        "min_largest_component_fraction": pipeline.min_component_fraction,
+                        "duplicate_mask_iou": pipeline.duplicate_iou,
+                        "allow_border_masks": pipeline.allow_border_masks},
         "detections": records,
+        "filtered_candidates": rejected,
     }
     (output_dir / f"{stem}_detections.json").write_text(
         json.dumps(report, indent=2) + "\n", encoding="utf-8"
     )
-    print(f"{stem}: {len(records)} detections, YOLO {detect_ms:.0f} ms, "
+    print(f"{stem}: {len(records)} detections ({len(rejected)} filtered), YOLO {detect_ms:.0f} ms, "
           f"SAM2 {segment_ms:.0f} ms -> {overlay_path}", flush=True)
 
 
@@ -203,8 +286,8 @@ def run_saved(source: Path, limit: int, pipeline: OpenVocabPipeline, output_dir:
         depth = read_depth(depth_path, bgr.shape[:2]) if depth_path.is_file() else None
         metadata = json.loads(metadata_path.read_text(encoding="utf-8")) if metadata_path.is_file() else None
         check_capture_fingerprints(metadata, cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB), depth)
-        detections, detect_ms, segment_ms = pipeline.infer(bgr)
-        save_frame(bgr, detections, str(path), stem, metadata, pipeline,
+        detections, rejected, detect_ms, segment_ms = pipeline.infer(bgr, depth)
+        save_frame(bgr, detections, rejected, str(path), stem, metadata, pipeline,
                    detect_ms, segment_ms, output_dir, path,
                    depth_path if depth is not None else None, depth)
 
@@ -241,8 +324,8 @@ def run_stream(endpoint: str, limit: int, pipeline: OpenVocabPipeline, output_di
                 if not cv2.imwrite(str(rgb_path), bgr):
                     raise OSError(f"Could not save {rgb_path}")
                 np.save(depth_path, depth)
-                detections, detect_ms, segment_ms = pipeline.infer(bgr)
-                save_frame(bgr, detections, endpoint, stem, metadata, pipeline,
+                detections, rejected, detect_ms, segment_ms = pipeline.infer(bgr, depth)
+                save_frame(bgr, detections, rejected, endpoint, stem, metadata, pipeline,
                            detect_ms, segment_ms, output_dir, rgb_path, depth_path, depth)
                 count += 1
         except KeyboardInterrupt:
@@ -260,19 +343,38 @@ def main() -> None:
     parser.add_argument("--frames", type=int, default=1, help="number of frames; 0 means all/continuous")
     parser.add_argument("--confidence", type=float, default=0.15, help="YOLO detection threshold")
     parser.add_argument("--max-detections", type=int, default=5)
+    parser.add_argument("--min-depth", type=float, default=0.15,
+                        help="near limit for RGB-D mask filtering, meters")
+    parser.add_argument("--max-depth", type=float, default=2.0,
+                        help="far limit for RGB-D mask filtering, meters")
+    parser.add_argument("--min-valid-depth-fraction", type=float, default=0.5)
+    parser.add_argument("--min-valid-depth-pixels", type=int, default=80)
+    parser.add_argument("--max-mask-fraction", type=float, default=0.5)
+    parser.add_argument("--min-largest-component-fraction", type=float, default=0.5)
+    parser.add_argument("--duplicate-mask-iou", type=float, default=0.85)
+    parser.add_argument("--allow-border-masks", action="store_true",
+                        help="keep incomplete masks touching the image edge")
     parser.add_argument("--device", default="auto", help="auto, cpu, or a CUDA device such as 0")
     parser.add_argument("--model-dir", type=Path, default=DEFAULT_OUTPUT / "models")
     parser.add_argument("--detector-model", default="yolov8s-worldv2.pt")
     parser.add_argument("--segmenter-model", default="sam2_t.pt")
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT)
     args = parser.parse_args()
-    if args.frames < 0 or not 0 <= args.confidence <= 1 or args.max_detections < 1:
-        parser.error("--frames must be >= 0, --confidence in [0, 1], and --max-detections >= 1")
+    if (args.frames < 0 or not 0 <= args.confidence <= 1 or args.max_detections < 1 or
+            not 0 < args.min_depth < args.max_depth or
+            not 0 <= args.min_valid_depth_fraction <= 1 or args.min_valid_depth_pixels < 1 or
+            not 0 < args.max_mask_fraction <= 1 or
+            not 0 <= args.min_largest_component_fraction <= 1 or
+            not 0 < args.duplicate_mask_iou <= 1):
+        parser.error("Invalid frame, confidence, depth, mask, or duplicate limits")
     args.model_dir.mkdir(parents=True, exist_ok=True)
     pipeline = OpenVocabPipeline(
         args.prompts, weight_path(args.model_dir, args.detector_model),
         weight_path(args.model_dir, args.segmenter_model), args.device,
-        args.confidence, args.max_detections,
+        args.confidence, args.max_detections, args.min_depth, args.max_depth,
+        args.min_valid_depth_fraction, args.min_valid_depth_pixels,
+        args.max_mask_fraction, args.min_largest_component_fraction,
+        args.duplicate_mask_iou, args.allow_border_masks,
     )
     if args.connect:
         run_stream(args.connect, args.frames, pipeline, args.output_dir)

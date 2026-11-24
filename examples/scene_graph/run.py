@@ -5,12 +5,13 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import textwrap
 from pathlib import Path
 
 import cv2
 import numpy as np
 
-from geometry import (backproject_mask, dense_component_pixels, infer_relations,
+from geometry import (backproject_mask, contact_patch, dense_component_pixels, infer_relations,
                       largest_metric_cluster, observed_aabb, transform_points,
                       world_from_optical)
 
@@ -147,6 +148,10 @@ def make_graph(report_path: Path, encoder: ClipEncoder, args: argparse.Namespace
 
     for index, detection in enumerate(report["detections"]):
         mask = load_mask(report_path, detection, depth.shape)
+        if not args.allow_border_masks and (mask[0].any() or mask[-1].any() or
+                                            mask[:, 0].any() or mask[:, -1].any()):
+            discarded.append({"mask_index": index, "reason": "truncated_at_image_border"})
+            continue
         optical, pixels = backproject_mask(depth, mask, metadata["intrinsics_opencv"],
                                            args.min_depth, args.max_depth, args.max_pixels)
         if len(optical) < args.min_points:
@@ -181,12 +186,23 @@ def make_graph(report_path: Path, encoder: ClipEncoder, args: argparse.Namespace
             "cluster_components": cluster["components"],
             "pointcloud_key": f"{object_id}_world_xyz_m",
         }
+        if table is not None:
+            node["table_contact"] = contact_patch(
+                selected, table["world_aabb_m"]["max"][2], args.contact_band,
+                args.voxel_size, args.cluster_radius)
         objects.append(node)
         crops.append(clip_crop(rgb, appearance_pixels))
 
     if objects:
         embeddings, similarities = encoder.encode(crops, report["prompts"])
         for node, crop, vector, scores in zip(objects, crops, embeddings, similarities):
+            ranked = np.argsort(scores)[::-1]
+            top_prompt = report["prompts"][int(ranked[0])]
+            margin = float(scores[ranked[0]] - scores[ranked[1]]) if len(ranked) > 1 else None
+            node["semantic_status"] = (
+                "distinct_within_prompts" if top_prompt == node["label"] and
+                margin is not None and margin >= args.clip_margin
+                else "ambiguous_within_prompts")
             crop_name = f"{report_stem(report_path)}_{node['id']}_clip_crop.png"
             crop_path = args.output_dir / crop_name
             args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -196,6 +212,8 @@ def make_graph(report_path: Path, encoder: ClipEncoder, args: argparse.Namespace
                 "model": "ViT-B/32", "crop_file": crop_name,
                 "crop_source": "full_resolution_pixels_near_retained_3d_cluster",
                 "image_embedding_l2": [round(float(value), 7) for value in vector],
+                "top_prompt": top_prompt,
+                "margin_to_second_prompt": round(margin, 5) if margin is not None else None,
                 "text_cosine": {prompt: round(float(value), 5)
                                 for prompt, value in zip(report["prompts"], scores)},
             }
@@ -203,7 +221,7 @@ def make_graph(report_path: Path, encoder: ClipEncoder, args: argparse.Namespace
     interiors = (json.loads(args.interiors.read_text(encoding="utf-8"))
                  if args.interiors is not None else None)
     edges = infer_relations(objects, table, interiors, args.support_tolerance,
-                            args.neighbor_distance)
+                            args.neighbor_distance, args.min_contact_points)
     graph = {
         "schema_version": 1, "coordinate_frame": "MuJoCo world, meters",
         "depth_convention": "camera optical axial Z, meters",
@@ -223,7 +241,11 @@ def make_graph(report_path: Path, encoder: ClipEncoder, args: argparse.Namespace
                        "cluster_radius_m": args.cluster_radius,
                        "min_cluster_points": args.min_points,
                        "support_tolerance_m": args.support_tolerance,
-                       "neighbor_distance_m": args.neighbor_distance},
+                       "contact_band_m": args.contact_band,
+                       "min_contact_patch_points": args.min_contact_points,
+                       "neighbor_distance_m": args.neighbor_distance,
+                       "clip_prompt_margin": args.clip_margin,
+                       "allow_border_masks": args.allow_border_masks},
         "nodes": nodes, "edges": edges, "discarded_detections": discarded,
     }
     return graph, pointclouds
@@ -235,7 +257,7 @@ def plot_graph(graph: dict, clouds: dict[str, np.ndarray], path: Path) -> None:
     import matplotlib.pyplot as plt
     from matplotlib.patches import FancyArrowPatch, FancyBboxPatch
 
-    fig = plt.figure(figsize=(11, 5.5), dpi=140)
+    fig = plt.figure(figsize=(12, 5.5), dpi=140)
     ax = fig.add_subplot(121, projection="3d")
     relations_ax = fig.add_subplot(122)
     objects = [node for node in graph["nodes"] if node["type"] == "object"]
@@ -264,37 +286,46 @@ def plot_graph(graph: dict, clouds: dict[str, np.ndarray], path: Path) -> None:
         ax.scatter(points[:, 0], points[:, 1], points[:, 2], s=2,
                    c=rgb, alpha=0.8, depthshade=False)
         center = node["centroid_world_m"]
-        ax.text(*center, node["id"], fontsize=8)
+        ax.text(center[0], center[1], float(points[:, 2].max()) + 0.012,
+                node["id"], fontsize=8,
+                bbox={"facecolor": "white", "alpha": 0.75, "edgecolor": "none", "pad": 1})
     if all_points:
         ax.set_xlim(x0, x1)
         ax.set_ylim(y0, y1)
         z_min = table["world_aabb_m"]["max"][2] if table else float(bounds[:, 2].min())
-        ax.set_zlim(z_min - 0.005, float(bounds[:, 2].max()) + 0.025)
-        ax.set_box_aspect((1, 1, 0.55))
+        z_max = float(bounds[:, 2].max()) + 0.035
+        ax.set_zlim(z_min - 0.005, z_max)
+        ax.set_box_aspect((x1 - x0, y1 - y0, z_max - z_min + 0.005))
     ax.set(xlabel="world X (m)", ylabel="world Y (m)", zlabel="world Z (m)")
     ax.set_title("Observed 3D points and table plane")
     ax.view_init(elev=26, azim=-55)
     relations_ax.set(xlim=(0, 1), ylim=(0, 1), title="Instance relations")
     relations_ax.axis("off")
-    object_x = [0.5] if len(objects) == 1 else np.linspace(0.1, 0.9, len(objects))
-    positions = {node["id"]: (x, 0.72) for node, x in zip(objects, object_x)}
+    ordered = sorted(objects, key=lambda node: node["centroid_world_m"][0])
+    object_x = [0.5] if len(ordered) == 1 else np.linspace(0.12, 0.88, len(ordered))
+    positions = {node["id"]: (x, 0.72) for node, x in zip(ordered, object_x)}
     if table is not None:
         positions["table"] = (0.5, 0.18)
     for edge in graph["edges"]:
         start, end = positions[edge["source"]], positions[edge["target"]]
+        lateral = edge["relation"] in ("next_to", "inside")
         relations_ax.add_patch(FancyArrowPatch(start, end,
             arrowstyle="<->" if edge.get("symmetric") else "-|>",
             mutation_scale=13, linewidth=1.6, color="#465569",
-            connectionstyle="arc3,rad=0.08", shrinkA=33, shrinkB=33))
-        midpoint = ((start[0] + end[0]) / 2, (start[1] + end[1]) / 2)
+            connectionstyle="arc3,rad=-0.5" if lateral else "arc3,rad=0.08",
+            shrinkA=33, shrinkB=33))
+        midpoint = ((start[0] + end[0]) / 2,
+                    0.89 if lateral else (start[1] + end[1]) / 2)
         relations_ax.text(*midpoint, edge["relation"], ha="center", va="center",
                           fontsize=9, bbox={"facecolor": "white", "edgecolor": "none", "pad": 2})
-    for node in objects:
+    for node in ordered:
         x, y = positions[node["id"]]
-        relations_ax.add_patch(FancyBboxPatch((x - 0.085, y - 0.075), 0.17, 0.15,
+        relations_ax.add_patch(FancyBboxPatch((x - 0.09, y - 0.09), 0.18, 0.18,
             boxstyle="round,pad=0.015", facecolor="#e9f0fa", edgecolor="#4b6c93"))
-        relations_ax.text(x, y, f"{node['id']}\n{node['label'][:16]}",
-                          ha="center", va="center", fontsize=8)
+        uncertain = "?" if node.get("semantic_status") == "ambiguous_within_prompts" else ""
+        display_label = "\n".join(textwrap.wrap(node["label"] + uncertain, width=13))
+        relations_ax.text(x, y, f"{node['id']}\n{display_label}",
+                          ha="center", va="center", fontsize=7.5)
     if table is not None:
         relations_ax.add_patch(FancyBboxPatch((0.38, 0.13), 0.24, 0.10,
             boxstyle="round,pad=0.015", facecolor="#f1e2d2", edgecolor="#a56d39"))
@@ -302,6 +333,8 @@ def plot_graph(graph: dict, clouds: dict[str, np.ndarray], path: Path) -> None:
     if not graph["edges"]:
         relations_ax.text(0.5, 0.42, "No relation passed the geometric thresholds",
                           ha="center", fontsize=9, color="#666666")
+    relations_ax.text(0.5, 0.03, "Left to right follows world X · ? marks an ambiguous prompt",
+                      ha="center", fontsize=8, color="#666666")
     fig.suptitle(f"Wrist RGB-D scene graph · frame {graph['frame']}", fontsize=13)
     fig.savefig(path, bbox_inches="tight")
     plt.close(fig)
@@ -333,14 +366,22 @@ def main() -> None:
     parser.add_argument("--cluster-radius", type=float, default=0.025)
     parser.add_argument("--min-points", type=int, default=80)
     parser.add_argument("--support-tolerance", type=float, default=0.025)
-    parser.add_argument("--neighbor-distance", type=float, default=0.12)
+    parser.add_argument("--contact-band", type=float, default=0.03,
+                        help="height above table plane for a visible contact patch")
+    parser.add_argument("--min-contact-points", type=int, default=20)
+    parser.add_argument("--neighbor-distance", type=float, default=0.08)
+    parser.add_argument("--clip-margin", type=float, default=0.04,
+                        help="minimum top-vs-second text cosine gap for a distinct prompt")
+    parser.add_argument("--allow-border-masks", action="store_true")
     parser.add_argument("--interiors", type=Path,
                         help="JSON mapping object IDs to calibrated world-frame interior AABBs")
     parser.add_argument("--no-plot", action="store_true")
     args = parser.parse_args()
     if (args.frames < 0 or not 0 < args.min_depth < args.max_depth or
             args.max_pixels < 1 or args.voxel_size <= 0 or args.cluster_radius <= 0 or
-            args.min_points < 1 or args.support_tolerance < 0 or args.neighbor_distance < 0):
+            args.min_points < 1 or args.support_tolerance < 0 or args.contact_band <= 0 or
+            args.min_contact_points < 1 or args.neighbor_distance < 0 or
+            not 0 <= args.clip_margin <= 2):
         parser.error("Invalid frame, depth, cluster, or relation limits")
     args.output_dir.mkdir(parents=True, exist_ok=True)
     encoder = ClipEncoder(args.device)

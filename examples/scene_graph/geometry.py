@@ -116,6 +116,22 @@ def observed_aabb(points: np.ndarray) -> dict:
     return {"min": lower.tolist(), "max": upper.tolist()}
 
 
+def contact_patch(points: np.ndarray, support_top: float, band: float,
+                  voxel_size: float, radius: float) -> dict:
+    """Find connected visible points close to a known horizontal support plane."""
+    near = points[(points[:, 2] >= support_top - 0.01) &
+                  (points[:, 2] <= support_top + band)]
+    retained, _ = largest_metric_cluster(near, voxel_size, radius, 1)
+    return {
+        "band_above_support_m": band,
+        "points_in_band": len(near),
+        "largest_connected_patch_points": len(retained),
+        "nearest_observed_gap_m": float(near[:, 2].min() - support_top) if len(near) else None,
+        "patch_centroid_world_m": np.median(near[retained], axis=0).tolist()
+        if len(retained) else None,
+    }
+
+
 def xy_overlap_fraction(a: dict, b: dict) -> float:
     a_min, a_max = np.asarray(a["min"]), np.asarray(a["max"])
     b_min, b_max = np.asarray(b["min"]), np.asarray(b["max"])
@@ -136,7 +152,8 @@ def xy_clearance(a: dict, b: dict) -> float:
 def infer_relations(objects: list[dict], table: dict | None,
                     interiors: dict[str, dict] | None = None,
                     support_tolerance: float = 0.025,
-                    neighbor_distance: float = 0.12) -> list[dict]:
+                    neighbor_distance: float = 0.08,
+                    min_contact_points: int = 20) -> list[dict]:
     """Produce geometric hypotheses; no edge is a calibrated probability."""
     edges = []
     supports = objects + ([table] if table is not None else [])
@@ -148,11 +165,19 @@ def infer_relations(objects: list[dict], table: dict | None,
             b = target["world_aabb_m"]
             gap = float(a["min"][2] - b["max"][2])
             overlap = xy_overlap_fraction(a, b)
-            if (-0.01 <= gap <= support_tolerance and overlap >= 0.3 and
-                    subject["centroid_world_m"][2] > b["min"][2]):
+            contact = subject.get("table_contact") if target["id"] == "table" else None
+            has_contact_patch = (contact is not None and
+                                 contact["largest_connected_patch_points"] >= min_contact_points)
+            if ((-0.01 <= gap <= support_tolerance or has_contact_patch) and
+                    overlap >= 0.3 and subject["centroid_world_m"][2] > b["min"][2]):
+                evidence = {"observed_bottom_gap_m": gap,
+                            "xy_overlap_fraction": overlap,
+                            "method": "connected_visible_contact_patch" if has_contact_patch
+                            else "observed_support_heuristic"}
+                if contact is not None:
+                    evidence["table_contact"] = contact
                 edges.append({"source": subject["id"], "target": target["id"],
-                              "relation": "on", "evidence": {"vertical_gap_m": gap,
-                              "xy_overlap_fraction": overlap, "method": "observed_support_heuristic"}})
+                              "relation": "on", "evidence": evidence})
 
     for index, left in enumerate(objects):
         for right in objects[index + 1:]:
