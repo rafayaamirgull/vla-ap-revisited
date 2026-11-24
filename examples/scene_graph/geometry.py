@@ -285,8 +285,12 @@ def infer_relations(objects: list[dict], table: dict | None,
             contact = subject.get("table_contact") if target["id"] == "table" else None
             has_contact_patch = (contact is not None and
                                  contact["largest_connected_patch_points"] >= min_contact_points)
+            ordered_above_object = (a["min"][2] > b["min"][2] and
+                                    a["max"][2] > b["max"][2])
+            ordered_above_support = (subject["centroid_world_m"][2] > b["min"][2]
+                                     if target["id"] == "table" else ordered_above_object)
             if ((-0.01 <= gap <= support_tolerance or has_contact_patch) and
-                    overlap >= 0.3 and subject["centroid_world_m"][2] > b["min"][2]):
+                    overlap >= 0.3 and ordered_above_support):
                 evidence = {"observed_bottom_gap_m": gap,
                             "xy_overlap_fraction": overlap,
                             "method": "connected_visible_contact_patch" if has_contact_patch

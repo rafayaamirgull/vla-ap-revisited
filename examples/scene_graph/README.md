@@ -8,19 +8,24 @@ Use the Docker container and dependencies described in the [main README](../../R
 
 ```bash
 docker exec vla_scenegraph_env /root/miniconda3/bin/python \
-  /workspace/examples/ur5e_eye_in_hand/run.py --frames 1 --seed 7 --hb-count 3
+  /workspace/examples/ur5e_eye_in_hand/run.py --frames 1 --seed 7 --hb-count 3 \
+  --output-dir /workspace/outputs/seed7_capture
 
 docker exec vla_scenegraph_env /root/miniconda3/bin/python \
   /workspace/examples/open_vocab_pipeline/run.py \
-  --prompts "red cube, green bell pepper, toy car" --confidence 0.005
+  --input /workspace/outputs/seed7_capture/frame_0000_rgb.png \
+  --prompts "red cube, green bell pepper, toy car" --confidence 0.005 \
+  --output-dir /workspace/outputs/seed7_perception
 
 docker exec vla_scenegraph_env /root/miniconda3/bin/python \
-  /workspace/examples/scene_graph/run.py
+  /workspace/examples/scene_graph/run.py \
+  --detections /workspace/outputs/seed7_perception/frame_0000_detections.json \
+  --output-dir /workspace/outputs/seed7_graph
 ```
 
-The first run of CLIP downloads its ViT-B/32 checkpoint into `/root/.cache/clip/` in the container. The [perception guide](../open_vocab_pipeline/README.md) shows how to keep this cache across container restarts. If HomebrewedDB is not mounted, the simulator captures only the cube and the graph still runs. A prompt that matches no visible object can produce zero detections.
+These separate directories keep the seed 7 capture from replacing the seed 1 RGB-D files referenced by the seed 1 perception report below. The first run of CLIP downloads its ViT-B/32 checkpoint into `/root/.cache/clip/` in the container. The [perception guide](../open_vocab_pipeline/README.md) shows how to keep this cache across container restarts. If HomebrewedDB is not mounted, the simulator captures only the cube and the graph still runs. A prompt that matches no visible object can produce zero detections.
 
-The graph step reads `outputs/open_vocab_pipeline/frame_0000_detections.json` by default and writes these files under `outputs/scene_graph/`:
+Without explicit paths, the graph step reads `outputs/open_vocab_pipeline/frame_0000_detections.json` and writes these files under `outputs/scene_graph/`:
 
 | File | Contents |
 | --- | --- |
@@ -33,7 +38,7 @@ The JSON is schema version 2. Existing binary `edges` remain; `pairwise_geometry
 
 Process all detection reports in one directory with `--detections /workspace/outputs/open_vocab_pipeline --frames 0`. Use a separate `--output-dir` for each experiment: `frame_0000` names are reused by different captures, and rerunning into the same output directory replaces earlier results. `--no-plot` skips the PNG. Use `--device cpu` if CUDA is unavailable.
 
-If you used the seed 1 prompt experiment in the [perception guide](../open_vocab_pipeline/README.md), pass its report explicitly:
+If you used the seed 1 prompt experiment in the [perception guide](../open_vocab_pipeline/README.md), pass its report explicitly. Its referenced `outputs/ur5e_eye_in_hand/frame_0000_*` RGB-D files must still be the original seed 1 capture; if they were overwritten, regenerate both the seed 1 capture and perception report first:
 
 ```bash
 docker exec vla_scenegraph_env /root/miniconda3/bin/python \
@@ -65,7 +70,7 @@ The graph keeps the detector's label as a prompt-conditioned candidate. It also 
 
 | Category | Current output and evidence |
 | --- | --- |
-| Physical support | `object on support`: the observed object bottom is within 2.5 cm above the support top, or at least 20 connected visible points lie within 3 cm above the known table plane. XY bounds must overlap. The table support is known static MuJoCo geometry, marked as such in the graph. This is a geometric support hypothesis, not a measured contact force. |
+| Physical support | `object on support`: the observed object bottom is from 1 cm below to 2.5 cm above the support top, or at least 20 connected visible points lie from 1 cm below to 3 cm above the known table plane. Observed XY bounds must overlap by at least 30% of the smaller footprint. Object-to-object `on` additionally requires both observed Z bounds of the subject to exceed the target's matching bounds; the table contact-patch path does not require this ordering. The table support is known static MuJoCo geometry, marked as such in the graph. This is a geometric support hypothesis, not a measured contact force. |
 | Containment | `object inside container` only when the object's observed bounds fit inside an explicitly supplied interior world AABB. |
 | Proximity | Symmetric `object next_to object` when observed XY bounds are within 8 cm, median heights are similar, and they do not overlap or already have an `on` relation. |
 | Metric geometry | Each unordered object pair has `centroid_delta_target_minus_source_world_m`, 3D and XY centroid distances, XY AABB clearance, XY overlap as a fraction of the smaller footprint, and 3D observed-AABB IoU in `pairwise_geometry`. Distances are in meters. These are visible-surface measurements, not a full 6D relative pose. |
@@ -75,7 +80,7 @@ The graph keeps the detector's label as a prompt-conditioned candidate. It also 
 
 The JSON permits multiple relation types for the same object pair; for example, one object can be both `left_of` and `in_front_of` another. The figure shows support, containment, and proximity as a compact graph. Its directed matrix shows every object-to-object relation and the 3D centroid distance, with the source in the row and target in the column; a separate callout shows ternary `between`. The JSON retains the complete evidence and metric values. X/Y directional order uses observed centroids, so partial masks and depth noise can move an edge across a threshold. Do not treat a direction edge as a calibrated probability.
 
-The default tabletop scene has no calibrated container interior, so it normally emits no `inside` edge. To test a container, create a JSON file mapping a detected container ID to its measured **interior** bounds in world meters, then pass `--interiors /workspace/path/to/interiors.json`. For example, replace these illustrative numbers with the actual cavity bounds for the current frame:
+The default tabletop scene has no calibrated container interior, so it normally emits no `inside` edge. To test a container, create a JSON file mapping a detected container ID to its measured **interior** bounds in world meters, then pass `--interiors /workspace/path/to/interiors.json`. Because object IDs are reassigned per frame, `--interiors` accepts only one selected detection report. For example, replace these illustrative numbers with the actual cavity bounds for the current frame:
 
 ```json
 {

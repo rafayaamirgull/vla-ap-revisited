@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 import tempfile
 import unittest
 from argparse import Namespace
 from pathlib import Path
+from unittest.mock import patch
 
 import cv2
 import numpy as np
@@ -15,7 +18,7 @@ from geometry import (backproject_mask, contact_patch, dense_component_pixels,
                       infer_between_relations, infer_directional_relations,
                       infer_relations, largest_metric_cluster, observed_aabb,
                       pairwise_geometry, transform_points, world_from_optical)
-from run import clip_crop, load_aligned_inputs, make_graph, sha256
+from run import clip_crop, load_aligned_inputs, main, make_graph, sha256
 
 
 def node(identifier, minimum, maximum):
@@ -113,6 +116,19 @@ class GeometryTests(unittest.TestCase):
                          [("on", "table")])
         self.assertEqual(edges[0]["evidence"]["method"], "connected_visible_contact_patch")
 
+    def test_object_support_requires_consistent_vertical_order(self):
+        first = node("first", [0, 0, 0.10], [0.05, 0.05, 0.105])
+        second = node("second", [0, 0, 0.10], [0.05, 0.05, 0.105])
+        self.assertFalse(any(edge["relation"] == "on" for edge in
+                             infer_relations([first, second], None)))
+
+        lower = node("lower", [0, 0, 0], [0.05, 0.05, 0.10])
+        upper = node("upper", [0, 0, 0.095], [0.05, 0.05, 0.15])
+        on_edges = [edge for edge in infer_relations([lower, upper], None)
+                    if edge["relation"] == "on"]
+        self.assertEqual([(edge["source"], edge["target"]) for edge in on_edges],
+                         [("upper", "lower")])
+
     def test_world_directions_have_inverse_edges_and_abstain_on_ties(self):
         left = node("left", [0, 0, 0], [0.04, 0.04, 0.04])
         right = node("right", [0.2, 0.2, 0], [0.24, 0.24, 0.04])
@@ -180,6 +196,26 @@ class GeometryTests(unittest.TestCase):
             self.assertTrue(cv2.imwrite(str(rgb_path), cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)))
             with self.assertRaisesRegex(ValueError, "fingerprint mismatch"):
                 load_aligned_inputs(root / "frame_detections.json", report)
+
+    def test_one_interior_file_cannot_calibrate_multiple_reports(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            reports = root / "reports"
+            reports.mkdir()
+            for index in range(2):
+                (reports / f"frame_{index:04d}_detections.json").write_text("{}")
+            interiors = root / "interiors.json"
+            interiors.write_text("{}")
+            output = root / "graph"
+            argv = ["run.py", "--detections", str(reports), "--frames", "0",
+                    "--interiors", str(interiors), "--output-dir", str(output)]
+            stderr = io.StringIO()
+            with patch("sys.argv", argv), contextlib.redirect_stderr(stderr):
+                with self.assertRaises(SystemExit) as error:
+                    main()
+            self.assertEqual(error.exception.code, 2)
+            self.assertIn("per-frame object IDs", stderr.getvalue())
+            self.assertFalse(output.exists())
 
     def test_graph_from_aligned_masked_depth(self):
         class FakeEncoder:

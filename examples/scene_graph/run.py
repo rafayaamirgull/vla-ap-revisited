@@ -504,9 +504,12 @@ def main() -> None:
             args.between_max_height_spread < 0 or
             not 0 <= args.clip_margin <= 2):
         parser.error("Invalid frame, depth, cluster, or relation limits")
+    paths = list(report_paths(args.detections, args.frames))
+    if args.interiors is not None and len(paths) > 1:
+        parser.error("--interiors calibrates per-frame object IDs; select one detection report")
     args.output_dir.mkdir(parents=True, exist_ok=True)
     encoder = ClipEncoder(args.device)
-    for path in report_paths(args.detections, args.frames):
+    for path in paths:
         graph, clouds = make_graph(path, encoder, args)
         stem = report_stem(path)
         graph["pointcloud_file"] = f"{stem}_points.npz"
