@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
+import os
 import time
 from pathlib import Path
 
@@ -27,6 +29,35 @@ def parse_prompts(value: str) -> list[str]:
 def weight_path(model_dir: Path, name: str) -> Path:
     path = Path(name)
     return path if path.is_absolute() else model_dir / path
+
+
+def input_record(path: Path, output_dir: Path, pixels: np.ndarray, encoding: str) -> dict:
+    """Hash decoded pixels, independent of PNG/NPY file headers and compression."""
+    return {
+        "path": Path(os.path.relpath(path.resolve(), output_dir.resolve())).as_posix(),
+        "sha256": hashlib.sha256(pixels.tobytes(order="C")).hexdigest(),
+        "shape": list(pixels.shape),
+        "encoding": encoding,
+    }
+
+
+def read_depth(path: Path, image_shape: tuple[int, int]) -> np.ndarray:
+    depth = np.load(path, allow_pickle=False)
+    if depth.shape != image_shape or depth.dtype.kind != "f" or depth.dtype.itemsize != 4:
+        raise ValueError(f"Expected float32 depth with shape {image_shape}: {path}")
+    return np.ascontiguousarray(depth, dtype="<f4")
+
+
+def check_capture_fingerprints(metadata: dict | None, rgb: np.ndarray,
+                               depth: np.ndarray | None) -> None:
+    """Catch a camera JSON paired with pixels from another capture."""
+    fingerprints = metadata.get("capture_fingerprints") if metadata is not None else None
+    if fingerprints is None:
+        return  # Older simulator captures have no embedded fingerprints.
+    if fingerprints.get("rgb_sha256") != hashlib.sha256(rgb.tobytes()).hexdigest():
+        raise ValueError("Camera metadata RGB fingerprint does not match the frame")
+    if depth is None or fingerprints.get("depth_sha256") != hashlib.sha256(depth.tobytes()).hexdigest():
+        raise ValueError("Camera metadata depth fingerprint does not match the frame")
 
 
 class OpenVocabPipeline:
@@ -93,8 +124,15 @@ class OpenVocabPipeline:
 
 def save_frame(bgr: np.ndarray, detections: list[dict], source: str, stem: str,
                camera_metadata: dict | None, pipeline: OpenVocabPipeline,
-               detect_ms: float, segment_ms: float, output_dir: Path) -> None:
+               detect_ms: float, segment_ms: float, output_dir: Path,
+               rgb_path: Path, depth_path: Path | None, depth: np.ndarray | None) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
+    rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+    inputs = {
+        "rgb": input_record(rgb_path, output_dir, rgb, "rgb8"),
+        "depth": input_record(depth_path, output_dir, depth, "float32_le_meters")
+        if depth_path is not None and depth is not None else None,
+    }
     overlay = bgr.copy()
     records = []
     for detection in detections:
@@ -113,16 +151,20 @@ def save_frame(bgr: np.ndarray, detections: list[dict], source: str, stem: str,
         cv2.putText(overlay, caption, (text_x + 2, text_y), cv2.FONT_HERSHEY_SIMPLEX,
                     0.5, (0, 0, 0), 1, cv2.LINE_AA)
         mask_name = f"{stem}_mask_{index:02d}.png"
-        if not cv2.imwrite(str(output_dir / mask_name), mask.astype(np.uint8) * 255):
+        mask_uint8 = np.ascontiguousarray(mask, dtype=np.uint8)
+        if not cv2.imwrite(str(output_dir / mask_name), mask_uint8 * 255):
             raise OSError(f"Could not save {mask_name}")
         records.append({key: value for key, value in detection.items() if key != "mask"} |
-                       {"mask_file": mask_name, "mask_area_px": int(np.count_nonzero(mask))})
+                       {"mask_file": mask_name,
+                        "mask_sha256": hashlib.sha256(mask_uint8.tobytes(order="C")).hexdigest(),
+                        "mask_area_px": int(np.count_nonzero(mask_uint8))})
 
     overlay_path = output_dir / f"{stem}_overlay.png"
     if not cv2.imwrite(str(overlay_path), overlay):
         raise OSError(f"Could not save {overlay_path}")
     report = {
         "source": source,
+        "inputs": inputs,
         "image_size": {"width": bgr.shape[1], "height": bgr.shape[0]},
         "prompts": pipeline.prompts,
         "models": {"detector": str(pipeline.detector_weight),
@@ -157,10 +199,14 @@ def run_saved(source: Path, limit: int, pipeline: OpenVocabPipeline, output_dir:
             raise ValueError(f"Cannot read image: {path}")
         stem = path.stem.removesuffix("_rgb")
         metadata_path = path.with_name(f"{stem}_camera.json")
+        depth_path = path.with_name(f"{stem}_depth.npy")
+        depth = read_depth(depth_path, bgr.shape[:2]) if depth_path.is_file() else None
         metadata = json.loads(metadata_path.read_text(encoding="utf-8")) if metadata_path.is_file() else None
+        check_capture_fingerprints(metadata, cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB), depth)
         detections, detect_ms, segment_ms = pipeline.infer(bgr)
         save_frame(bgr, detections, str(path), stem, metadata, pipeline,
-                   detect_ms, segment_ms, output_dir)
+                   detect_ms, segment_ms, output_dir, path,
+                   depth_path if depth is not None else None, depth)
 
 
 def run_stream(endpoint: str, limit: int, pipeline: OpenVocabPipeline, output_dir: Path) -> None:
@@ -176,17 +222,28 @@ def run_stream(endpoint: str, limit: int, pipeline: OpenVocabPipeline, output_di
         count = 0
         try:
             while limit == 0 or count < limit:
-                topic, header, rgb_bytes, _depth_bytes = subscriber.recv_multipart()
+                topic, header, rgb_bytes, depth_bytes = subscriber.recv_multipart()
                 if topic != b"rgbd":
                     continue
                 metadata = json.loads(header)
                 height, width = metadata["height"], metadata["width"]
+                if (metadata.get("rgb_encoding") != "rgb8" or
+                        metadata.get("depth_encoding") != "float32_le_meters"):
+                    raise ValueError("Expected rgb8 and float32_le_meters ZMQ frame encodings")
                 rgb = np.frombuffer(rgb_bytes, dtype=np.uint8).reshape(height, width, 3)
+                depth = np.frombuffer(depth_bytes, dtype="<f4").reshape(height, width)
+                check_capture_fingerprints(metadata, rgb, depth)
                 bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
                 stem = f"frame_{metadata['frame']:04d}"
+                output_dir.mkdir(parents=True, exist_ok=True)
+                rgb_path = output_dir / f"{stem}_rgb.png"
+                depth_path = output_dir / f"{stem}_depth.npy"
+                if not cv2.imwrite(str(rgb_path), bgr):
+                    raise OSError(f"Could not save {rgb_path}")
+                np.save(depth_path, depth)
                 detections, detect_ms, segment_ms = pipeline.infer(bgr)
                 save_frame(bgr, detections, endpoint, stem, metadata, pipeline,
-                           detect_ms, segment_ms, output_dir)
+                           detect_ms, segment_ms, output_dir, rgb_path, depth_path, depth)
                 count += 1
         except KeyboardInterrupt:
             print("Stopped by user", flush=True)

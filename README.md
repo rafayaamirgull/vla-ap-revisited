@@ -22,6 +22,7 @@ Object choice and placement are repeatable with a seed. The RealSense image is 6
 
 - `examples/ur5e_eye_in_hand/` — scene builder, interactive viewer, RGB-D capture, and optional ZMQ subscriber.
 - `examples/open_vocab_pipeline/` — YOLO-World detection and SAM2 Tiny segmentation of wrist RGB frames.
+- `examples/scene_graph/` — metric back-projection, wrist-to-world transforms, CLIP embeddings, and instance relations.
 - `examples/maniskill3/` — a separate ManiSkill PickCube experiment.
 - `thirdparty/mujoco_menagerie/` — only the UR5e, 2F-85, and D435i model assets used here.
 - `thirdparty/maniskill3/` — ManiSkill 3.0.1 package source and bundled assets.
@@ -36,13 +37,16 @@ Start from this directory. The HomebrewedDB mount is read-only:
 
 ```bash
 HB_ROOT='/media/rafay/Windows-SSD/other/data/open_source/HB_HomebrewedDB_TUM'
+XAUTH_FILE="${XAUTHORITY:-$HOME/.Xauthority}"
 docker run -it --rm --name vla_scenegraph_env --gpus all --ipc=host --network=host \
-  -e DISPLAY="$DISPLAY" \
+  -e DISPLAY="$DISPLAY" -e XAUTHORITY=/tmp/.Xauthority \
   -e NVIDIA_DRIVER_CAPABILITIES=compute,utility,graphics,display \
-  -v /tmp/.X11-unix:/tmp/.X11-unix \
+  -v /tmp/.X11-unix:/tmp/.X11-unix -v "$XAUTH_FILE":/tmp/.Xauthority:ro \
   -v "$PWD":/workspace -v "$HB_ROOT":/datasets/homebrewed:ro \
   -w /workspace -d vla_scenegraph_env:v01
 ```
+
+The Xauthority mount lets the container authenticate to the host X server for MuJoCo rendering. Make sure `HB_ROOT` points to the mounted dataset; an empty directory produces the cube-only scene.
 
 With the container running, open the scene or the live camera view:
 
@@ -95,6 +99,20 @@ docker exec -it vla_scenegraph_env /root/miniconda3/bin/python \
 ```
 
 See [the open-vocabulary example guide](examples/open_vocab_pipeline/README.md) for saved-frame, directory, and live ZMQ modes, plus the mask and JSON outputs.
+
+## Build the 3D scene graph
+
+After a **fresh** RGB-D capture and detection run, build a world-frame graph from the saved masks and depth:
+
+```bash
+docker exec vla_scenegraph_env /root/miniconda3/bin/python \
+  /workspace/examples/scene_graph/run.py
+```
+
+<p align="center"><a href="docs/images/scene_graph_cube_seed7.png"><img src="docs/images/scene_graph_cube_seed7.png" width="800" alt="Observed red-cube point cloud next to a graph with object_00 on table"></a></p>
+<p align="center"><sub>Fresh cube-only capture: observed RGB-D points in world meters and the resulting <code>on</code> edge</sub></p>
+
+The JSON output records per-instance 3D points, observed bounds, a 512-value CLIP image embedding, prompt similarities, and spatial edges. The graph checks RGB, depth, mask, and camera metadata fingerprints before projecting points. For `inside`, provide a calibrated container interior; the single wrist view cannot infer an unseen cavity reliably. See the [scene-graph guide](examples/scene_graph/README.md) for equations, output files, thresholds, and limitations.
 
 ## Run the ManiSkill example
 

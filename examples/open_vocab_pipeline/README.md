@@ -35,7 +35,7 @@ docker exec -it vla_scenegraph_env /root/miniconda3/bin/python \
 
 To process a capture directory, pass the directory to `--input` and use `--frames 0` for every `frame_*_rgb.png`. Change prompts freely, for example `--prompts "red mug, drawer handle, screwdriver"`. A prompt for an object absent from the scene may produce zero detections; the JSON and overlay are still written. The default confidence threshold is 0.15. The lower value in the example reveals small simulated objects with scores around 0.01, so inspect the overlay and treat those labels as tentative.
 
-Results appear under `outputs/open_vocab_pipeline/`. `frame_0000_overlay.png` shows the boxes and masks; `frame_0000_mask_00.png` is a single-object binary mask; `frame_0000_detections.json` records the results and, for simulator captures, the camera pose and intrinsics. This phase uses RGB for inference; depth remains in the original capture for later 3D reasoning.
+Results appear under `outputs/open_vocab_pipeline/`. `frame_0000_overlay.png` shows the boxes and masks; `frame_0000_mask_00.png` is a single-object binary mask; `frame_0000_detections.json` records the results and, for simulator captures, the camera pose and intrinsics. Its `inputs` field names the RGB image and optional aligned depth array using paths relative to the JSON file. The SHA-256 values cover decoded RGB pixels in H×W×3 `uint8` order and metric depth pixels in H×W little-endian `float32` order, not PNG or NPY file bytes. Each detection also has `mask_sha256` for the H×W binary mask in `uint8` 0/1 order. Fresh simulator captures additionally carry matching RGB-D fingerprints in the camera metadata; the 3D graph requires them so it cannot silently use a stale pose. A regular RGB image without a sibling `_depth.npy` records `"depth": null`; the 3D graph step requires depth.
 
 ## Live frames from MuJoCo
 
@@ -56,4 +56,4 @@ docker exec -it vla_scenegraph_env /root/miniconda3/bin/python \
   --publish 'tcp://*:5555' --no-save --seed 7 --hb-count 3
 ```
 
-Stop either process with Ctrl+C. The subscriber keeps only a small input queue, so it may drop frames if inference takes longer than the simulator's frame interval. It runs YOLO-World and SAM2 independently on each received frame; it does not track object identity across frames.
+Stop either process with Ctrl+C. For each received frame, the subscriber also saves `frame_XXXX_rgb.png` and `frame_XXXX_depth.npy` beside its detection JSON so the 3D graph step can load the exact inputs. The subscriber keeps only a small input queue, so it may drop frames if inference takes longer than the simulator's frame interval. It runs YOLO-World and SAM2 independently on each received frame; it does not track object identity across frames.
