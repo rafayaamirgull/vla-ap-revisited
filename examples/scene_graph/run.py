@@ -11,9 +11,10 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-from geometry import (backproject_mask, contact_patch, dense_component_pixels, infer_relations,
-                      largest_metric_cluster, observed_aabb, transform_points,
-                      world_from_optical)
+from geometry import (backproject_mask, contact_patch, dense_component_pixels,
+                      infer_between_relations, infer_directional_relations,
+                      infer_relations, largest_metric_cluster, observed_aabb,
+                      pairwise_geometry, transform_points, world_from_optical)
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -148,8 +149,9 @@ def make_graph(report_path: Path, encoder: ClipEncoder, args: argparse.Namespace
 
     for index, detection in enumerate(report["detections"]):
         mask = load_mask(report_path, detection, depth.shape)
-        if not args.allow_border_masks and (mask[0].any() or mask[-1].any() or
-                                            mask[:, 0].any() or mask[:, -1].any()):
+        touches_border = bool(mask[0].any() or mask[-1].any() or
+                              mask[:, 0].any() or mask[:, -1].any())
+        if not args.allow_border_masks and touches_border:
             discarded.append({"mask_index": index, "reason": "truncated_at_image_border"})
             continue
         optical, pixels = backproject_mask(depth, mask, metadata["intrinsics_opencv"],
@@ -185,6 +187,16 @@ def make_graph(report_path: Path, encoder: ClipEncoder, args: argparse.Namespace
             "appearance_pixels": len(appearance_pixels),
             "cluster_components": cluster["components"],
             "pointcloud_key": f"{object_id}_world_xyz_m",
+            "visibility": {
+                "camera": metadata.get("camera", "wrist_rgbd"),
+                "visible_mask_pixels": int(np.count_nonzero(mask)),
+                "valid_depth_fraction": float(np.count_nonzero(
+                    mask & np.isfinite(depth) &
+                    (depth >= args.min_depth) & (depth <= args.max_depth)) /
+                    np.count_nonzero(mask)),
+                "touches_image_border": touches_border,
+                "occluded_fraction": None,
+            },
         }
         if table is not None:
             node["table_contact"] = contact_patch(
@@ -222,8 +234,17 @@ def make_graph(report_path: Path, encoder: ClipEncoder, args: argparse.Namespace
                  if args.interiors is not None else None)
     edges = infer_relations(objects, table, interiors, args.support_tolerance,
                             args.neighbor_distance, args.min_contact_points)
+    edges.extend(infer_directional_relations(objects, args.direction_deadband,
+                                            args.vertical_xy_overlap))
+    pair_metrics = pairwise_geometry(objects)
+    ternary_relations = infer_between_relations(
+        objects, args.between_max_perpendicular, args.between_min_anchor_distance,
+        args.between_max_height_spread)
     graph = {
-        "schema_version": 1, "coordinate_frame": "MuJoCo world, meters",
+        "schema_version": 2, "coordinate_frame": "MuJoCo world, meters",
+        "workspace_axes": {"origin": "robot stand at world XY (0, 0)",
+                           "right": "+world_X", "forward": "+world_Y",
+                           "up": "+world_Z"},
         "depth_convention": "camera optical axial Z, meters",
         "frame": metadata.get("frame"), "simulation_time_s": metadata.get("simulation_time_s"),
         "camera": {"intrinsics_opencv": metadata["intrinsics_opencv"],
@@ -244,9 +265,16 @@ def make_graph(report_path: Path, encoder: ClipEncoder, args: argparse.Namespace
                        "contact_band_m": args.contact_band,
                        "min_contact_patch_points": args.min_contact_points,
                        "neighbor_distance_m": args.neighbor_distance,
+                       "direction_deadband_m": args.direction_deadband,
+                       "vertical_min_xy_overlap_fraction": args.vertical_xy_overlap,
+                       "between_max_perpendicular_m": args.between_max_perpendicular,
+                       "between_min_anchor_distance_m": args.between_min_anchor_distance,
+                       "between_max_height_spread_m": args.between_max_height_spread,
                        "clip_prompt_margin": args.clip_margin,
                        "allow_border_masks": args.allow_border_masks},
-        "nodes": nodes, "edges": edges, "discarded_detections": discarded,
+        "nodes": nodes, "edges": edges, "pairwise_geometry": pair_metrics,
+        "ternary_relations": ternary_relations,
+        "discarded_detections": discarded,
     }
     return graph, pointclouds
 
@@ -257,10 +285,15 @@ def plot_graph(graph: dict, clouds: dict[str, np.ndarray], path: Path) -> None:
     import matplotlib.pyplot as plt
     from matplotlib.patches import FancyArrowPatch, FancyBboxPatch
 
-    fig = plt.figure(figsize=(12, 5.5), dpi=140)
-    ax = fig.add_subplot(121, projection="3d")
-    relations_ax = fig.add_subplot(122)
     objects = [node for node in graph["nodes"] if node["type"] == "object"]
+    matrix_height = max(6.2, 0.95 * len(objects) + 2.4)
+    fig = plt.figure(figsize=(14, 5.3 + matrix_height), dpi=140)
+    layout = fig.add_gridspec(2, 2, height_ratios=[5.3, matrix_height],
+                             hspace=0.15, wspace=0.12, top=0.94, bottom=0.06,
+                             left=0.05, right=0.98)
+    ax = fig.add_subplot(layout[0, 0], projection="3d")
+    relations_ax = fig.add_subplot(layout[0, 1])
+    matrix_ax = fig.add_subplot(layout[1, :])
     table = next((node for node in graph["nodes"] if node["id"] == "table"), None)
     all_points = [clouds[node["pointcloud_key"]] for node in objects]
     if all_points:
@@ -299,14 +332,17 @@ def plot_graph(graph: dict, clouds: dict[str, np.ndarray], path: Path) -> None:
     ax.set(xlabel="world X (m)", ylabel="world Y (m)", zlabel="world Z (m)")
     ax.set_title("Observed 3D points and table plane")
     ax.view_init(elev=26, azim=-55)
-    relations_ax.set(xlim=(0, 1), ylim=(0, 1), title="Instance relations")
+    relations_ax.set(xlim=(0, 1), ylim=(0, 1),
+                     title="Support, containment, and proximity")
     relations_ax.axis("off")
     ordered = sorted(objects, key=lambda node: node["centroid_world_m"][0])
     object_x = [0.5] if len(ordered) == 1 else np.linspace(0.12, 0.88, len(ordered))
     positions = {node["id"]: (x, 0.72) for node, x in zip(ordered, object_x)}
     if table is not None:
         positions["table"] = (0.5, 0.18)
-    for edge in graph["edges"]:
+    plotted_edges = [edge for edge in graph["edges"]
+                     if edge["relation"] in ("on", "inside", "next_to")]
+    for edge in plotted_edges:
         start, end = positions[edge["source"]], positions[edge["target"]]
         lateral = edge["relation"] in ("next_to", "inside")
         relations_ax.add_patch(FancyArrowPatch(start, end,
@@ -330,11 +366,83 @@ def plot_graph(graph: dict, clouds: dict[str, np.ndarray], path: Path) -> None:
         relations_ax.add_patch(FancyBboxPatch((0.38, 0.13), 0.24, 0.10,
             boxstyle="round,pad=0.015", facecolor="#f1e2d2", edgecolor="#a56d39"))
         relations_ax.text(0.5, 0.18, "table", ha="center", va="center", fontsize=9)
-    if not graph["edges"]:
-        relations_ax.text(0.5, 0.42, "No relation passed the geometric thresholds",
+    if not plotted_edges:
+        relations_ax.text(0.5, 0.42, "No support, containment, or proximity edge to plot",
                           ha="center", fontsize=9, color="#666666")
     relations_ax.text(0.5, 0.03, "Left to right follows world X · ? marks an ambiguous prompt",
                       ha="center", fontsize=8, color="#666666")
+
+    matrix_ax.set(xlim=(0, 1), ylim=(0, 1))
+    matrix_ax.axis("off")
+    matrix_ax.set_title("Object relations · source row → target column", fontsize=12, pad=12)
+    if objects:
+        lookup = {node["id"]: node for node in objects}
+        ordered_ids = [node["id"] for node in ordered]
+        pair_distances = {}
+        for pair in graph.get("pairwise_geometry", []):
+            pair_distances[frozenset((pair["source"], pair["target"]))] = pair["centroid_distance_m"]
+        cell_relations = {}
+        for edge in graph["edges"]:
+            if edge["source"] not in lookup or edge["target"] not in lookup:
+                continue
+            cell_relations.setdefault((edge["source"], edge["target"]), []).append(
+                edge["relation"])
+            if edge.get("symmetric"):
+                cell_relations.setdefault((edge["target"], edge["source"]), []).append(
+                    edge["relation"])
+        x_left, x_right = 0.16, 0.98
+        y_bottom, y_top = 0.25, 0.78
+        cell_width = (x_right - x_left) / len(ordered_ids)
+        cell_height = (y_top - y_bottom) / len(ordered_ids)
+        cell_font = max(7.5, 9.5 - 0.3 * max(0, len(ordered_ids) - 4))
+        for column, identifier in enumerate(ordered_ids):
+            label = "\n".join(textwrap.wrap(lookup[identifier]["label"], width=14))
+            matrix_ax.text(x_left + (column + 0.5) * cell_width, 0.9,
+                           f"{identifier}\n{label}", ha="center", va="center",
+                           fontsize=9, fontweight="bold")
+        for row, source in enumerate(ordered_ids):
+            y_center = y_top - (row + 0.5) * cell_height
+            label = "\n".join(textwrap.wrap(lookup[source]["label"], width=17))
+            matrix_ax.text(x_left - 0.015, y_center, f"{source}\n{label}",
+                           ha="right", va="center", fontsize=9, fontweight="bold")
+            for column, target in enumerate(ordered_ids):
+                x_center = x_left + (column + 0.5) * cell_width
+                same = source == target
+                matrix_ax.add_patch(FancyBboxPatch(
+                    (x_center - cell_width / 2 + 0.003,
+                     y_center - cell_height / 2 + 0.003),
+                    cell_width - 0.006, cell_height - 0.006,
+                    boxstyle="round,pad=0.002",
+                    facecolor="#f0f1f3" if same else "#eaf3fb",
+                    edgecolor="#d4dce5", linewidth=0.8))
+                if same:
+                    text = "—"
+                else:
+                    relations = cell_relations.get((source, target), [])
+                    distance = pair_distances.get(frozenset((source, target)))
+                    lines = relations + ([f"{distance:.2f} m"] if distance is not None else [])
+                    text = "\n".join(lines) if lines else "—"
+                matrix_ax.text(x_center, y_center, text, ha="center", va="center",
+                               fontsize=cell_font, linespacing=1.05, color="#243447")
+        between_lines = []
+        for relation in graph.get("ternary_relations", []):
+            if relation["relation"] == "between":
+                first, second = relation["references"]
+                between_lines.append(
+                    f"{lookup[relation['subject']]['label']} ({relation['subject']}) between "
+                    f"{lookup[first]['label']} ({first}) and {lookup[second]['label']} ({second}) "
+                    f"(XY offset {relation['evidence']['perpendicular_distance_m']:.3f} m)")
+        if between_lines:
+            matrix_ax.text(0.5, 0.15, "Between: " + " · ".join(between_lines),
+                           ha="center", va="center", fontsize=10, color="#5c3c12",
+                           bbox={"boxstyle": "round,pad=0.5", "facecolor": "#fff2d8",
+                                 "edgecolor": "#d7a65c"})
+        matrix_ax.text(0.5, 0.04,
+                       "Workspace: +X right, +Y forward, +Z up · distance between observed 3D centroids",
+                       ha="center", va="center", fontsize=9, color="#5b6670")
+    else:
+        matrix_ax.text(0.5, 0.5, "No accepted object instances", ha="center",
+                       va="center", fontsize=11, color="#666666")
     fig.suptitle(f"Wrist RGB-D scene graph · frame {graph['frame']}", fontsize=13)
     fig.savefig(path, bbox_inches="tight")
     plt.close(fig)
@@ -370,6 +478,14 @@ def main() -> None:
                         help="height above table plane for a visible contact patch")
     parser.add_argument("--min-contact-points", type=int, default=20)
     parser.add_argument("--neighbor-distance", type=float, default=0.08)
+    parser.add_argument("--direction-deadband", type=float, default=0.04,
+                        help="minimum world X/Y centroid difference for directional edges")
+    parser.add_argument("--vertical-xy-overlap", type=float, default=0.15,
+                        help="minimum observed XY overlap for above/below")
+    parser.add_argument("--between-max-perpendicular", type=float, default=0.06,
+                        help="maximum XY distance from the anchor segment")
+    parser.add_argument("--between-min-anchor-distance", type=float, default=0.15)
+    parser.add_argument("--between-max-height-spread", type=float, default=0.12)
     parser.add_argument("--clip-margin", type=float, default=0.04,
                         help="minimum top-vs-second text cosine gap for a distinct prompt")
     parser.add_argument("--allow-border-masks", action="store_true")
@@ -381,6 +497,11 @@ def main() -> None:
             args.max_pixels < 1 or args.voxel_size <= 0 or args.cluster_radius <= 0 or
             args.min_points < 1 or args.support_tolerance < 0 or args.contact_band <= 0 or
             args.min_contact_points < 1 or args.neighbor_distance < 0 or
+            args.direction_deadband < 0 or
+            not 0 <= args.vertical_xy_overlap <= 1 or
+            args.between_max_perpendicular < 0 or
+            args.between_min_anchor_distance <= 0 or
+            args.between_max_height_spread < 0 or
             not 0 <= args.clip_margin <= 2):
         parser.error("Invalid frame, depth, cluster, or relation limits")
     args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -395,7 +516,8 @@ def main() -> None:
         if not args.no_plot:
             plot_graph(graph, clouds, args.output_dir / f"{stem}_scene_graph.png")
         print(f"{stem}: {sum(node['type'] == 'object' for node in graph['nodes'])} objects, "
-              f"{len(graph['edges'])} relations, {len(graph['discarded_detections'])} rejected masks "
+              f"{len(graph['edges'])} binary, {len(graph['ternary_relations'])} between relations, "
+              f"{len(graph['discarded_detections'])} rejected masks "
               f"-> {args.output_dir}", flush=True)
 
 

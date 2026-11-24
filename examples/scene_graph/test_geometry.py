@@ -12,8 +12,9 @@ import cv2
 import numpy as np
 
 from geometry import (backproject_mask, contact_patch, dense_component_pixels,
+                      infer_between_relations, infer_directional_relations,
                       infer_relations, largest_metric_cluster, observed_aabb,
-                      transform_points, world_from_optical)
+                      pairwise_geometry, transform_points, world_from_optical)
 from run import clip_crop, load_aligned_inputs, make_graph, sha256
 
 
@@ -112,6 +113,53 @@ class GeometryTests(unittest.TestCase):
                          [("on", "table")])
         self.assertEqual(edges[0]["evidence"]["method"], "connected_visible_contact_patch")
 
+    def test_world_directions_have_inverse_edges_and_abstain_on_ties(self):
+        left = node("left", [0, 0, 0], [0.04, 0.04, 0.04])
+        right = node("right", [0.2, 0.2, 0], [0.24, 0.24, 0.04])
+        edges = infer_directional_relations([left, right])
+        triples = {(e["source"], e["relation"], e["target"]) for e in edges}
+        self.assertEqual(triples, {("left", "left_of", "right"),
+                                   ("right", "right_of", "left"),
+                                   ("left", "behind", "right"),
+                                   ("right", "in_front_of", "left")})
+        self.assertTrue(all(e["frame"] == "workspace_world" for e in edges))
+        lateral = [e for e in edges if e["relation"] in ("left_of", "right_of")]
+        self.assertAlmostEqual(sum(e["evidence"]["target_minus_source_m"]
+                                   for e in lateral), 0.0)
+        tie = node("tie", [0.03, 0, 0], [0.07, 0.04, 0.04])
+        self.assertEqual(infer_directional_relations([left, tie]), [])
+
+        lower = node("lower", [0, 0, 0], [0.1, 0.1, 0.1])
+        upper = node("upper", [0, 0, 0.11], [0.1, 0.1, 0.2])
+        vertical = infer_directional_relations([lower, upper])
+        self.assertEqual({e["relation"] for e in vertical}, {"above", "below"})
+        upper["world_aabb_m"]["min"][:2] = [0.2, 0.2]
+        upper["world_aabb_m"]["max"][:2] = [0.3, 0.3]
+        self.assertFalse(any(e["relation"] in ("above", "below") for e in
+                             infer_directional_relations([lower, upper])))
+
+    def test_pair_metrics_and_ternary_between_keep_geometry_explicit(self):
+        first = node("first", [-0.02, -0.02, 0], [0.02, 0.02, 0.04])
+        middle = node("middle", [0.09, 0.0, 0], [0.13, 0.04, 0.04])
+        last = node("last", [0.20, -0.02, 0], [0.24, 0.02, 0.04])
+        metrics = pairwise_geometry([first, last])
+        self.assertEqual(len(metrics), 1)
+        self.assertAlmostEqual(metrics[0]["centroid_distance_m"], 0.22)
+        self.assertEqual(metrics[0]["centroid_delta_target_minus_source_world_m"],
+                         [0.22, 0.0, 0.0])
+        self.assertAlmostEqual(metrics[0]["xy_clearance_m"], 0.18)
+        self.assertEqual(metrics[0]["observed_aabb_iou_3d"], 0.0)
+        between = infer_between_relations([first, middle, last])
+        self.assertEqual([(r["subject"], r["references"]) for r in between],
+                         [("middle", ["first", "last"])])
+        self.assertEqual(between[0]["frame"], "workspace_world_xy")
+        shuffled = infer_between_relations([last, middle, first])
+        self.assertEqual(shuffled[0]["references"], between[0]["references"])
+        self.assertAlmostEqual(shuffled[0]["evidence"]["segment_fraction"],
+                               between[0]["evidence"]["segment_fraction"])
+        middle["centroid_world_m"][1] = 0.15
+        self.assertEqual(infer_between_relations([first, middle, last]), [])
+
     def test_replaced_rgb_is_rejected(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -188,11 +236,22 @@ class GeometryTests(unittest.TestCase):
                              min_points=8, voxel_size=0.008, cluster_radius=0.04,
                              support_tolerance=0.025, contact_band=0.03,
                              min_contact_points=20, neighbor_distance=0.08,
+                             direction_deadband=0.04, vertical_xy_overlap=0.15,
+                             between_max_perpendicular=0.06,
+                             between_min_anchor_distance=0.15,
+                             between_max_height_spread=0.12,
                              clip_margin=0.04, allow_border_masks=False,
                              interiors=None, output_dir=root / "graph")
             graph, clouds = make_graph(report_path, FakeEncoder(), args)
+            self.assertEqual(graph["schema_version"], 2)
+            self.assertEqual(graph["pairwise_geometry"], [])
+            self.assertEqual(graph["ternary_relations"], [])
             self.assertEqual(len(graph["nodes"]), 2)
             cube = graph["nodes"][1]
+            self.assertEqual(cube["visibility"]["visible_mask_pixels"], 24)
+            self.assertEqual(cube["visibility"]["valid_depth_fraction"], 1.0)
+            self.assertFalse(cube["visibility"]["touches_image_border"])
+            self.assertIsNone(cube["visibility"]["occluded_fraction"])
             self.assertAlmostEqual(cube["centroid_world_m"][2], 0.05)
             self.assertEqual(cube["clip"]["image_embedding_l2"][0], 1.0)
             self.assertEqual(len(clouds[cube["pointcloud_key"]]), 8)

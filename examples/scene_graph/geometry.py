@@ -1,4 +1,4 @@
-"""Metric geometry and conservative spatial relations for one RGB-D frame."""
+"""Metric geometry and evidence-aware spatial relations for one RGB-D frame."""
 
 from __future__ import annotations
 
@@ -147,6 +147,123 @@ def xy_clearance(a: dict, b: dict) -> float:
     b_min, b_max = np.asarray(b["min"]), np.asarray(b["max"])
     gap = np.maximum(0.0, np.maximum(a_min[:2] - b_max[:2], b_min[:2] - a_max[:2]))
     return float(np.linalg.norm(gap))
+
+
+def pairwise_geometry(objects: list[dict]) -> list[dict]:
+    """Measure unordered object pairs from visible-surface centroids and bounds."""
+    pairs = []
+    for index, source in enumerate(objects):
+        for target in objects[index + 1:]:
+            a, b = source["world_aabb_m"], target["world_aabb_m"]
+            a_min, a_max = np.asarray(a["min"]), np.asarray(a["max"])
+            b_min, b_max = np.asarray(b["min"]), np.asarray(b["max"])
+            delta = (np.asarray(target["centroid_world_m"]) -
+                     np.asarray(source["centroid_world_m"]))
+            intersection_size = np.maximum(0.0, np.minimum(a_max, b_max) -
+                                           np.maximum(a_min, b_min))
+            intersection = float(np.prod(intersection_size))
+            union = (float(np.prod(a_max - a_min)) +
+                     float(np.prod(b_max - b_min)) - intersection)
+            pairs.append({
+                "source": source["id"], "target": target["id"],
+                "frame": "workspace_world", "geometry_source": "observed_masked_depth",
+                "centroid_delta_target_minus_source_world_m": delta.tolist(),
+                "centroid_distance_m": float(np.linalg.norm(delta)),
+                "centroid_xy_distance_m": float(np.linalg.norm(delta[:2])),
+                "xy_clearance_m": xy_clearance(a, b),
+                "xy_overlap_fraction_of_smaller": xy_overlap_fraction(a, b),
+                "observed_aabb_iou_3d": intersection / union if union > 0 else 0.0,
+            })
+    return pairs
+
+
+def infer_directional_relations(objects: list[dict], deadband: float = 0.04,
+                                min_vertical_xy_overlap: float = 0.15) -> list[dict]:
+    """Order visible objects in the workspace: +X right, +Y front, +Z up.
+
+    XY relations use observed centroids with a deadband. Vertical relations
+    require separated observed Z intervals and overlapping XY footprints.
+    Every asserted directed relation has its inverse in the output.
+    """
+    if deadband < 0 or not 0 <= min_vertical_xy_overlap <= 1:
+        raise ValueError("Invalid directional relation limits")
+    edges = []
+    for index, a in enumerate(objects):
+        for b in objects[index + 1:]:
+            delta = np.asarray(b["centroid_world_m"]) - np.asarray(a["centroid_world_m"])
+            for axis, negative, positive in ((0, "left_of", "right_of"),
+                                             (1, "behind", "in_front_of")):
+                if abs(delta[axis]) <= deadband:
+                    continue
+                a_relation, b_relation = ((negative, positive) if delta[axis] > 0
+                                          else (positive, negative))
+                evidence = {"method": "observed_centroid_axis_order",
+                            "axis": "xyz"[axis], "deadband_m": deadband}
+                edges.extend((
+                    {"source": a["id"], "target": b["id"], "relation": a_relation,
+                     "frame": "workspace_world",
+                     "evidence": {**evidence, "target_minus_source_m": float(delta[axis])}},
+                    {"source": b["id"], "target": a["id"], "relation": b_relation,
+                     "frame": "workspace_world",
+                     "evidence": {**evidence, "target_minus_source_m": -float(delta[axis])}},
+                ))
+            overlap = xy_overlap_fraction(a["world_aabb_m"], b["world_aabb_m"])
+            a_bounds, b_bounds = a["world_aabb_m"], b["world_aabb_m"]
+            a_above_gap = float(a_bounds["min"][2] - b_bounds["max"][2])
+            b_above_gap = float(b_bounds["min"][2] - a_bounds["max"][2])
+            if overlap < min_vertical_xy_overlap or max(a_above_gap, b_above_gap) < 0:
+                continue
+            upper, lower = (a, b) if a_above_gap >= 0 else (b, a)
+            evidence = {"method": "separated_observed_z_intervals",
+                        "observed_vertical_clearance_m": max(a_above_gap, b_above_gap),
+                        "xy_overlap_fraction": overlap,
+                        "min_xy_overlap_fraction": min_vertical_xy_overlap}
+            edges.extend((
+                {"source": upper["id"], "target": lower["id"],
+                 "relation": "above", "frame": "workspace_world", "evidence": evidence},
+                {"source": lower["id"], "target": upper["id"],
+                 "relation": "below", "frame": "workspace_world", "evidence": evidence},
+            ))
+    return edges
+
+
+def infer_between_relations(objects: list[dict], max_perpendicular: float = 0.06,
+                            min_anchor_distance: float = 0.15,
+                            max_height_spread: float = 0.12) -> list[dict]:
+    """Find tabletop A between anchors B and C; retain the two anchors as a pair."""
+    if max_perpendicular < 0 or min_anchor_distance <= 0 or max_height_spread < 0:
+        raise ValueError("Invalid between relation limits")
+    relations = []
+    for subject in objects:
+        anchors = sorted((node for node in objects if node["id"] != subject["id"]),
+                         key=lambda node: node["id"])
+        for index, first in enumerate(anchors):
+            for second in anchors[index + 1:]:
+                center = np.asarray(subject["centroid_world_m"])
+                start = np.asarray(first["centroid_world_m"])
+                end = np.asarray(second["centroid_world_m"])
+                baseline = end[:2] - start[:2]
+                separation = float(np.linalg.norm(baseline))
+                if separation < min_anchor_distance:
+                    continue
+                fraction = float(np.dot(center[:2] - start[:2], baseline) /
+                                 separation ** 2)
+                perpendicular = float(np.linalg.norm(
+                    center[:2] - (start[:2] + fraction * baseline)))
+                height_spread = float(np.ptp([center[2], start[2], end[2]]))
+                if (0.15 <= fraction <= 0.85 and perpendicular <= max_perpendicular and
+                        height_spread <= max_height_spread):
+                    relations.append({
+                        "subject": subject["id"],
+                        "references": [first["id"], second["id"]],
+                        "relation": "between", "frame": "workspace_world_xy",
+                        "evidence": {"method": "observed_centroid_segment_projection",
+                                     "segment_fraction": fraction,
+                                     "perpendicular_distance_m": perpendicular,
+                                     "anchor_separation_m": separation,
+                                     "centroid_height_spread_m": height_spread},
+                    })
+    return relations
 
 
 def infer_relations(objects: list[dict], table: dict | None,

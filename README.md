@@ -112,10 +112,10 @@ docker exec vla_scenegraph_env /root/miniconda3/bin/python \
   --output-dir /workspace/outputs/seed1_graph
 ```
 
-<p align="center"><a href="docs/images/scene_graph_seed1.png"><img src="docs/images/scene_graph_seed1.png" width="800" alt="Seed 1 observed point clouds and graph with four object-on-table hypotheses"></a></p>
-<p align="center"><sub>Seed 1 observed RGB-D surfaces in world meters and four <code>on table</code> relation hypotheses</sub></p>
+<p align="center"><a href="docs/images/scene_graph_seed1.png"><img src="docs/images/scene_graph_seed1.png" width="1000" alt="Seed 1 scene graph showing observed 3D surfaces, four on-table edges, directed pair relations with distances, and a between relation"></a></p>
+<p align="center"><sub>Seed 1 · observed 3D surfaces, support edges, source-to-target directional relations and distances, and the planar <code>between</code> relation</sub></p>
 
-The JSON output records per-instance 3D points, observed bounds, a 512-value CLIP image embedding, prompt similarities, and spatial edges. The graph checks RGB, depth, mask, and camera metadata fingerprints before projecting points. For `inside`, provide a calibrated container interior; the single wrist view cannot infer an unseen cavity reliably. See the [scene-graph guide](examples/scene_graph/README.md) for equations, output files, thresholds, and limitations.
+The output includes per-instance 3D point clouds, observed bounds, a 512-value CLIP image embedding, prompt similarities, pairwise metric geometry, and spatial relations such as support, world-frame directions, and `between`. The graph checks RGB, depth, mask, and camera metadata fingerprints before projecting points. For `inside`, provide a calibrated container interior; the single wrist view cannot infer an unseen cavity reliably. Contact, attachment, occlusion, and action effects need additional evidence and are not asserted from this frame. See the [scene-graph guide](examples/scene_graph/README.md) for relation definitions, equations, output files, and limits, plus how the [EmbodimentSemantic benchmark](https://huggingface.co/datasets/SemVLA/EmbodimentSemantic) could be used for comparison.
 
 ## Run the ManiSkill example
 
