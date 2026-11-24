@@ -7,6 +7,7 @@ Tested with MuJoCo 4.0.1 and NumPy. pyzmq is optional.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import random
@@ -219,13 +220,34 @@ def build_scene(hb_root: Path | None = None, seed: int | None = None,
 
 def camera_metadata(model: mujoco.MjModel, data: mujoco.MjData, frame: int,
                     scene: SceneBuild) -> dict:
+    def world_pose(position: np.ndarray, rotation: np.ndarray) -> np.ndarray:
+        transform = np.eye(4)
+        transform[:3, :3] = rotation.reshape(3, 3)
+        transform[:3, 3] = position
+        return transform
+
+    def inverse_pose(transform: np.ndarray) -> np.ndarray:
+        inverse = np.eye(4)
+        inverse[:3, :3] = transform[:3, :3].T
+        inverse[:3, 3] = -inverse[:3, :3] @ transform[:3, 3]
+        return inverse
+
     camera_id = model.camera(CAMERA_NAME).id
     fy = HEIGHT / (2.0 * math.tan(math.radians(FOVY_DEG) / 2.0))
-    world_from_mujoco_camera = np.eye(4)
-    world_from_mujoco_camera[:3, :3] = data.cam_xmat[camera_id].reshape(3, 3)
-    world_from_mujoco_camera[:3, 3] = data.cam_xpos[camera_id]
+    world_from_mujoco_camera = world_pose(data.cam_xpos[camera_id], data.cam_xmat[camera_id])
     # OpenCV optical coordinates: +X right, +Y down, +Z forward.
     world_from_optical = world_from_mujoco_camera @ np.diag([1.0, -1.0, -1.0, 1.0])
+    base_id = model.body("base").id
+    ee_id = model.site("attachment_site").id
+    world_from_base = world_pose(data.xpos[base_id], data.xmat[base_id])
+    world_from_ee = world_pose(data.site_xpos[ee_id], data.site_xmat[ee_id])
+    base_from_ee = inverse_pose(world_from_base) @ world_from_ee
+    ee_from_camera_optical = inverse_pose(world_from_ee) @ world_from_optical
+
+    table_id = model.geom("table").id
+    table_center = data.geom_xpos[table_id]
+    table_rotation = data.geom_xmat[table_id].reshape(3, 3)
+    table_extent = np.abs(table_rotation) @ model.geom_size[table_id, :3]
     return {
         "frame": frame,
         "simulation_time_s": float(data.time),
@@ -238,6 +260,18 @@ def camera_metadata(model: mujoco.MjModel, data: mujoco.MjData, frame: int,
             "fx": fy, "fy": fy, "cx": WIDTH / 2.0, "cy": HEIGHT / 2.0,
         },
         "world_from_camera_optical": world_from_optical.tolist(),
+        "kinematic_chain": {
+            "world_from_base": world_from_base.tolist(),
+            "base_from_ee": base_from_ee.tolist(),
+            "ee_from_camera_optical": ee_from_camera_optical.tolist(),
+        },
+        "static_geometry": [{
+            "name": "table",
+            "world_aabb_m": {
+                "min": (table_center - table_extent).tolist(),
+                "max": (table_center + table_extent).tolist(),
+            },
+        }],
         "joint_positions_rad": {
             mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_JOINT, i): float(data.qpos[i])
             for i in range(6)
@@ -336,6 +370,10 @@ def main() -> None:
                 mujoco.mj_forward(model, data)
                 rgb, depth = capture(renderer, data)
                 meta = camera_metadata(model, data, frame, scene)
+                meta["capture_fingerprints"] = {
+                    "rgb_sha256": hashlib.sha256(rgb.tobytes()).hexdigest(),
+                    "depth_sha256": hashlib.sha256(depth.tobytes()).hexdigest(),
+                }
                 stem = f"frame_{frame:04d}"
                 if not args.no_save:
                     (args.output_dir / f"{stem}_rgb.png").write_bytes(rgb_png(rgb))
