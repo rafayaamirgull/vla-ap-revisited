@@ -23,6 +23,7 @@ Object choice and placement are repeatable with a seed. The RealSense image is 6
 - `examples/ur5e_eye_in_hand/` — scene builder, interactive viewer, RGB-D capture, and optional ZMQ subscriber.
 - `examples/open_vocab_pipeline/` — YOLO-World detection and SAM2 Tiny segmentation of wrist RGB frames.
 - `examples/scene_graph/` — metric back-projection, wrist-to-world transforms, CLIP embeddings, and instance relations.
+- `examples/action_primitives/` — Jacobian IK grasp, place, tabletop push, and drawer actions with simulated contact checks.
 - `examples/maniskill3/` — a separate ManiSkill PickCube experiment.
 - `thirdparty/mujoco_menagerie/` — only the UR5e, 2F-85, and D435i model assets used here.
 - `thirdparty/maniskill3/` — ManiSkill 3.0.1 package source and bundled assets.
@@ -116,6 +117,33 @@ docker exec vla_scenegraph_env /root/miniconda3/bin/python \
 <p align="center"><sub>Seed 1 · observed 3D surfaces, support edges, source-to-target directional relations and distances, and the planar <code>between</code> relation</sub></p>
 
 The output includes per-instance 3D point clouds, observed bounds, a 512-value CLIP image embedding, prompt similarities, pairwise metric geometry, and spatial relations such as support, world-frame directions, and `between`. The graph checks RGB, depth, mask, and camera metadata fingerprints before projecting points. For `inside`, provide a calibrated container interior; the single wrist view cannot infer an unseen cavity reliably. Contact, attachment, occlusion, and action effects need additional evidence and are not asserted from this frame. See the [scene-graph guide](examples/scene_graph/README.md) for relation definitions, equations, output files, and limits, plus how the [EmbodimentSemantic benchmark](https://huggingface.co/datasets/SemVLA/EmbodimentSemantic) could be used for comparison.
+
+## Run Phase 2 action primitives
+
+The UR5e now has contact-checked Jacobian IK actions for grasping, placing, or pushing a graph node, plus pulling and closing an optional sliding drawer. Start with the repeatable cube and drawer fixtures:
+
+```bash
+docker exec vla_scenegraph_env /root/miniconda3/bin/python \
+  /workspace/examples/action_primitives/run.py --action grasp-place
+docker exec vla_scenegraph_env /root/miniconda3/bin/python \
+  /workspace/examples/action_primitives/run.py --action pull-push \
+  --output-dir /workspace/outputs/action_primitives/drawer_demo
+```
+
+The first demo labels its cube bounds as simulator fixture data. The [action-primitives guide](examples/action_primitives/README.md) shows the complete route from a fresh wrist RGB-D capture through YOLO-World, SAM2, and the 3D scene graph to `grasp(node_id)`. It also explains world-frame target regions, outcome files, and current limits.
+
+Larger seed-1 objects exceed the current top-down 2F-85 grasp width. The guide includes tested `--action push` commands and a separate absolute world target for each seed-1 object. Capture a random HomebrewedDB scene once and keep its RGB-D, detection report, and graph paired: action replay reads the saved seed and object-count mode automatically. Repeated action runs receive a new numbered output directory so earlier videos remain available.
+
+To **watch** the pick and the changing graph, add `--visualize`. The window shows a MuJoCo overview, the wrist camera, and live object relations; it also saves an MP4. `--native-viewer` opens a second, mouse-controlled 3D MuJoCo window. Add `--perception-checkpoints` to run YOLO-World, SAM2, and the observed scene-graph pipeline on frames saved before and after the action:
+
+```bash
+docker exec -it vla_scenegraph_env /root/miniconda3/bin/python \
+  /workspace/examples/action_primitives/run.py --action grasp-place \
+  --visualize --perception-checkpoints \
+  --output-dir /workspace/outputs/action_primitives/live_pick
+```
+
+The live graph reads simulator poses and contacts and is labeled **simulator state**. The checkpoint graphs come from wrist RGB-D perception. The held cube can be outside the wrist camera's usable view even while the live graph shows it in the gripper; the guide explains this distinction and the saved files.
 
 ## Run the ManiSkill example
 

@@ -43,6 +43,9 @@ class SceneBuild:
     model: mujoco.MjModel
     objects: list[dict]
     seed: int | None
+    with_drawer: bool = False
+    requested_hb_count: int | None = None
+    include_large: bool = False
 
 
 def resolve_hb_root(requested: Path | None) -> Path | None:
@@ -56,7 +59,7 @@ def resolve_hb_root(requested: Path | None) -> Path | None:
 
 
 def _place_objects(spec: mujoco.MjSpec, hb_root: Path, seed: int, count: int | None,
-                   include_large: bool) -> list[dict]:
+                   include_large: bool, with_drawer: bool = False) -> list[dict]:
     rng = random.Random(seed)
     candidate_ids = available_objects(hb_root, include_large=include_large)
     count = count if count is not None else rng.choice((2, 3))
@@ -64,6 +67,8 @@ def _place_objects(spec: mujoco.MjSpec, hb_root: Path, seed: int, count: int | N
     for _ in range(100):
         selected_ids = rng.sample(candidate_ids, count)
         occupied = [(-0.34, 0.39, 0.05)]  # cube plus a little clearance
+        if with_drawer:
+            occupied.append((0.05, 0.68, 0.24))  # drawer and its pull travel
         placements = []
         for index, object_id in enumerate(selected_ids):
             info = model_info[str(object_id)]
@@ -116,9 +121,42 @@ def _place_objects(spec: mujoco.MjSpec, hb_root: Path, seed: int, count: int | N
     return objects
 
 
+def add_drawer(spec: mujoco.MjSpec) -> None:
+    """Add a shallow drawer with a top-graspable handle and a 12 cm pull stroke."""
+    housing = spec.worldbody.add_body(name="drawer_housing", pos=[0.05, 0.72, 0.27])
+    housing.add_geom(name="drawer_base", type=mujoco.mjtGeom.mjGEOM_BOX,
+                     pos=[0, 0, -0.01], size=[0.145, 0.17, 0.01],
+                     contype=0, conaffinity=0, rgba=[0.35, 0.38, 0.42, 1])
+    for side, x in (("left", -0.135), ("right", 0.135)):
+        housing.add_geom(name=f"drawer_{side}_rail", type=mujoco.mjtGeom.mjGEOM_BOX,
+                         pos=[x, 0, 0.035], size=[0.01, 0.17, 0.035],
+                         contype=0, conaffinity=0, rgba=[0.31, 0.34, 0.38, 1])
+    tray = housing.add_body(name="drawer_tray", pos=[0, 0, 0.01])
+    tray.add_joint(name="drawer_slide", type=mujoco.mjtJoint.mjJNT_SLIDE,
+                   axis=[0, -1, 0], range=[0, 0.12], limited=True,
+                   damping=1.5, armature=0.02, frictionloss=0.5)
+    tray.add_geom(name="drawer_floor", type=mujoco.mjtGeom.mjGEOM_BOX,
+                  pos=[0, 0, 0], size=[0.11, 0.13, 0.01],
+                  density=500, rgba=[0.68, 0.70, 0.71, 1])
+    for side, x in (("left", -0.105), ("right", 0.105)):
+        tray.add_geom(name=f"drawer_tray_{side}_wall", type=mujoco.mjtGeom.mjGEOM_BOX,
+                      pos=[x, 0, 0.03], size=[0.008, 0.13, 0.03],
+                      density=500, rgba=[0.74, 0.76, 0.77, 1])
+    for side, y in (("front", -0.125), ("back", 0.125)):
+        tray.add_geom(name=f"drawer_tray_{side}_wall", type=mujoco.mjtGeom.mjGEOM_BOX,
+                      pos=[0, y, 0.03], size=[0.11, 0.008, 0.03],
+                      density=500, rgba=[0.74, 0.76, 0.77, 1])
+    tray.add_geom(name="drawer_handle_geom", type=mujoco.mjtGeom.mjGEOM_CYLINDER,
+                  pos=[0, -0.125, 0.085], size=[0.012, 0.05, 0],
+                  density=500, rgba=[0.10, 0.12, 0.14, 1])
+    tray.add_site(name="drawer_handle", pos=[0, -0.125, 0.085],
+                  size=[0.003, 0.003, 0.003], rgba=[0.1, 0.5, 0.8, 1])
+
+
 def build_scene(hb_root: Path | None = None, seed: int | None = None,
-                hb_count: int | None = None, include_large: bool = False) -> SceneBuild:
-    hb_root = resolve_hb_root(hb_root)
+                hb_count: int | None = None, include_large: bool = False,
+                with_drawer: bool = False, cube_only: bool = False) -> SceneBuild:
+    hb_root = None if cube_only else resolve_hb_root(hb_root)
     spec = mujoco.MjSpec.from_file(str(ROBOT_XML))
     spec.modelname = "UR5e 2F-85 side-camera tabletop"
     spec.visual.global_.offwidth = WIDTH
@@ -203,6 +241,8 @@ def build_scene(hb_root: Path | None = None, seed: int | None = None,
         pos=[0.0, 0.55, 0.20], size=[0.65, 0.38, 0.05],
         rgba=[0.55, 0.42, 0.28, 1.0],
     )
+    if with_drawer:
+        add_drawer(spec)
 
     cube = world.add_body(name="red_cube", pos=[-0.34, 0.39, 0.29])
     cube.add_freejoint()
@@ -213,9 +253,12 @@ def build_scene(hb_root: Path | None = None, seed: int | None = None,
     if hb_root is not None:
         if seed is None:
             seed = random.SystemRandom().randrange(2**32)
-        objects.extend(_place_objects(spec, hb_root, seed, hb_count, include_large))
+        objects.extend(_place_objects(spec, hb_root, seed, hb_count, include_large,
+                                      with_drawer=with_drawer))
 
-    return SceneBuild(spec.compile(), objects, seed if hb_root is not None else None)
+    return SceneBuild(spec.compile(), objects, seed if hb_root is not None else None,
+                      with_drawer, hb_count if hb_root is not None else None,
+                      include_large)
 
 
 def camera_metadata(model: mujoco.MjModel, data: mujoco.MjData, frame: int,
@@ -283,6 +326,11 @@ def camera_metadata(model: mujoco.MjModel, data: mujoco.MjData, frame: int,
         },
         "gripper_pinch_world_position_m": data.site_xpos[model.site(GRIPPER_PINCH_SITE_NAME).id].tolist(),
         "scene_seed": scene.seed,
+        "with_drawer": scene.with_drawer,
+        "scene_generation": {
+            "requested_hb_count": scene.requested_hb_count,
+            "include_large": scene.include_large,
+        },
         "objects": [
             {**item,
              "world_position_m": data.xpos[model.body(item["name"]).id].tolist(),
@@ -314,6 +362,10 @@ def main() -> None:
     parser.add_argument("--hb-count", type=int, choices=(2, 3), help="otherwise randomly choose 2 or 3 objects")
     parser.add_argument("--seed", type=int, help="repeatable object choice and placement")
     parser.add_argument("--include-large", action="store_true", help="allow all 33 models, including large ones")
+    parser.add_argument("--cube-only", action="store_true",
+                        help="disable HomebrewedDB placement for a repeatable cube control fixture")
+    parser.add_argument("--with-drawer", action="store_true",
+                        help="add an articulated drawer with a top-graspable pull handle")
     parser.add_argument("--gripper-command", type=float, default=0.0,
                         help="2F-85 command from 0 (open) to 255 (closed)")
     args = parser.parse_args()
@@ -323,6 +375,9 @@ def main() -> None:
         parser.error("--no-save requires --publish")
     if not 0.0 <= args.gripper_command <= 255.0:
         parser.error("--gripper-command must be in [0, 255]")
+    if args.cube_only and (args.hb_root is not None or args.hb_count is not None or
+                           args.include_large):
+        parser.error("--cube-only cannot be combined with HomebrewedDB options")
 
     publisher = context = None
     if args.publish:
@@ -336,7 +391,8 @@ def main() -> None:
         publisher.bind(args.publish)
         print(f"Publishing RGB-D on {args.publish}", flush=True)
 
-    scene = build_scene(args.hb_root, args.seed, args.hb_count, args.include_large)
+    scene = build_scene(args.hb_root, args.seed, args.hb_count, args.include_large,
+                        with_drawer=args.with_drawer, cube_only=args.cube_only)
     model = scene.model
     if scene.seed is not None:
         selected = [item["object_id"] for item in scene.objects if item["object_id"] is not None]
