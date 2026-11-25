@@ -120,6 +120,9 @@ The output includes per-instance 3D point clouds, observed bounds, a 512-value C
 
 ## Run Phase 2 action primitives
 
+<p align="center"><a href="docs/images/ur5e_frog_push.gif"><img src="docs/images/ur5e_frog_push.gif" width="1000" alt="UR5e pushes a green toy frog across the table, with the wrist camera and live scene graph alongside the MuJoCo overview"></a></p>
+<p align="center"><sub>Seed 1 · The UR5e pushes the frog about 20 cm. The live graph updates its position and spatial relations.</sub></p>
+
 The UR5e now has contact-checked Jacobian IK actions for grasping, placing, or pushing a graph node, plus pulling and closing an optional sliding drawer. Start with the repeatable cube and drawer fixtures:
 
 ```bash
